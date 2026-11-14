@@ -1,0 +1,209 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Futbolito Analytics</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="/static/styles.css">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
+</head>
+<body>
+<header class="topbar">
+  <div class="brand">
+    <span class="logo" aria-hidden="true">⚽</span>
+    <div>
+      <h1>Futbolito Analytics</h1>
+      <p class="sub" id="dataStamp">Loading…</p>
+    </div>
+  </div>
+  <div class="controls">
+    <label>League <select id="league"></select></label>
+    <label>Season <select id="season"></select></label>
+    <button id="refresh" class="btn primary" title="Download the latest results, odds and player data">
+      <span class="spin" aria-hidden="true">↻</span> Refresh data
+    </button>
+    <button id="themeToggle" class="btn ghost" title="Toggle light / dark" aria-label="Toggle light / dark">☾ Theme</button>
+  </div>
+</header>
+
+<nav class="tabs" role="tablist">
+  <button class="tab active" data-tab="overview">Overview</button>
+  <button class="tab" data-tab="team">Teams</button>
+  <button class="tab" data-tab="predict">Match Predictor</button>
+  <button class="tab" data-tab="fixtures">Upcoming</button>
+  <button class="tab" data-tab="players">Players</button>
+  <button class="tab" data-tab="lab">Model Lab</button>
+</nav>
+
+<main>
+  <!-- ============================== OVERVIEW -->
+  <section id="tab-overview" class="panel active">
+    <div class="kpis" id="kpis"></div>
+    <div class="grid two">
+      <div class="card span2">
+        <div class="card-head">
+          <h2>League table</h2>
+          <div class="seg" id="tableVenue">
+            <button data-v="all" class="on">All</button><button data-v="home">Home</button><button data-v="away">Away</button>
+          </div>
+        </div>
+        <div class="table-wrap"><table id="leagueTable" class="data"></table></div>
+        <p class="note">Home / Away views are the split tables your spreadsheet used (GF/GP and GA/GP per venue). xG columns appear when the source provides xG.</p>
+      </div>
+      <div class="card">
+        <h2>Team strength map</h2>
+        <p class="hint">Dixon-Coles ratings. Right = scores more than average, up = concedes less. Top-right is the best place to be.</p>
+        <div class="chart tall"><canvas id="strengthChart"></canvas></div>
+      </div>
+      <div class="card">
+        <h2>Elo rating</h2>
+        <p class="hint">Updated after every match; bigger wins move it more. Carries across seasons.</p>
+        <div class="chart tall"><canvas id="eloChart"></canvas></div>
+      </div>
+      <div class="card span2">
+        <h2>Goals per game, by week</h2>
+        <div class="chart"><canvas id="trendChart"></canvas></div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============================== TEAM -->
+  <section id="tab-team" class="panel">
+    <div class="toolbar">
+      <label>Team <select id="teamSelect"></select></label>
+      <label>Rolling window
+        <select id="teamWindow"><option>3</option><option selected>5</option><option>8</option><option>10</option></select>
+      </label>
+    </div>
+    <div class="kpis" id="teamKpis"></div>
+    <div class="grid two">
+      <div class="card">
+        <h2>Goals: scored vs conceded <span class="muted" id="rollLbl">(rolling 5)</span></h2>
+        <div class="chart"><canvas id="teamGoals"></canvas></div>
+      </div>
+      <div class="card">
+        <h2>Expected goals: for vs against <span class="muted">(rolling)</span></h2>
+        <div class="chart"><canvas id="teamXg"></canvas></div>
+        <p class="note" id="xgNote"></p>
+      </div>
+      <div class="card">
+        <h2>Goal difference per match</h2>
+        <div class="chart"><canvas id="teamGd"></canvas></div>
+      </div>
+      <div class="card">
+        <h2>Points accumulated</h2>
+        <div class="chart"><canvas id="teamPts"></canvas></div>
+      </div>
+      <div class="card span2">
+        <h2>Match log</h2>
+        <div class="table-wrap"><table id="teamLog" class="data"></table></div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============================== PREDICTOR -->
+  <section id="tab-predict" class="panel">
+    <div class="toolbar">
+      <label>Home <select id="homeSelect"></select></label>
+      <button class="btn ghost" id="swap" title="Swap home and away">⇄</button>
+      <label>Away <select id="awaySelect"></select></label>
+      <label>Model <select id="modelSelect"></select></label>
+    </div>
+    <div id="predictOut"></div>
+  </section>
+
+  <!-- ============================== FIXTURES -->
+  <section id="tab-fixtures" class="panel">
+    <div class="card">
+      <div class="card-head"><h2>Upcoming fixtures — blended model</h2></div>
+      <p class="hint">Probabilities from the blended model. When bookmaker odds are published, <b>Edge</b> = model probability − market probability (margin removed). Positive edge means the model rates that outcome higher than the market does.</p>
+      <div id="fixturesOut"></div>
+    </div>
+  </section>
+
+  <!-- ============================== PLAYERS -->
+  <section id="tab-players" class="panel">
+    <div id="playersUnavailable" class="card hidden"><p>Player data comes from the official Fantasy Premier League API, so it's available for the <b>Premier League</b> only.</p></div>
+    <div id="playersBody">
+      <div class="toolbar">
+        <label>Team <select id="pTeam"><option value="">All teams</option></select></label>
+        <label>Position <select id="pPos"><option value="">All</option><option>FWD</option><option>MID</option><option>DEF</option><option>GK</option></select></label>
+        <label>Min. minutes <input id="pMin" type="number" value="270" step="90" min="0"></label>
+        <input id="pSearch" type="search" placeholder="Search player…">
+      </div>
+      <div class="grid two">
+        <div class="card">
+          <h2>Finishing: goals vs expected goals</h2>
+          <p class="hint">Above the line = scoring more than chances suggest (hot finishing, often regresses). Below = unlucky / wasteful.</p>
+          <div class="chart tall"><canvas id="xgScatter"></canvas></div>
+        </div>
+        <div class="card">
+          <h2 id="playerTitle">Player — last gameweeks</h2>
+          <p class="hint" id="playerHint">Click a player in the table or chart.</p>
+          <div class="chart tall"><canvas id="playerChart"></canvas></div>
+        </div>
+        <div class="card span2">
+          <div class="table-wrap tall"><table id="playersTable" class="data sortable"></table></div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============================== LAB -->
+  <section id="tab-lab" class="panel">
+    <div class="card">
+      <h2>How good is each model? <span class="muted" id="btSeason"></span></h2>
+      <p class="hint">Walk-forward backtest: before each week, every model is refitted using only matches played <i>before</i> that week, then it predicts that week's games. Bookmakers are the benchmark to beat. Lower log-loss / RPS / Brier is better.</p>
+      <div id="btOut" class="loading">Running backtest… (takes a few seconds the first time)</div>
+    </div>
+    <div class="grid two">
+      <div class="card">
+        <h2>Log-loss by model <span class="muted">(lower is better)</span></h2>
+        <div class="chart"><canvas id="btChart"></canvas></div>
+      </div>
+      <div class="card">
+        <h2>Calibration: home-win probability</h2>
+        <p class="hint">When a model says 60%, does the home side win ~60% of the time? On the diagonal = honest probabilities.</p>
+        <div class="chart"><canvas id="calibChart"></canvas></div>
+      </div>
+      <div class="card span2">
+        <h2>What the ML model learned</h2>
+        <p class="hint">Standardised coefficients of the Poisson regression. Positive = more goals for that side. Bigger bar = that last-5 signal matters more.</p>
+        <div class="grid two inner">
+          <div><h3>Home goals</h3><div class="chart"><canvas id="impHome"></canvas></div></div>
+          <div><h3>Away goals</h3><div class="chart"><canvas id="impAway"></canvas></div></div>
+        </div>
+      </div>
+      <div class="card span2 prose">
+        <h2>The models</h2>
+        <dl>
+          <dt>Your sheet (season home/away)</dt>
+          <dd>A straight port of the Goals tab: home attack = home GF/GP ÷ league avg, away defence = away GA/GP ÷ league avg, projected goals = attack × defence × league average, then a Poisson score grid.</dd>
+          <dt>Last-5 form (+xG)</dt>
+          <dd>Same idea, but strengths come from each team's last 5 matches, with goals blended 50/50 with xG when available, and shrunk toward average because 5 games is a small sample.</dd>
+          <dt>Dixon-Coles (time-weighted)</dt>
+          <dd>Fits attack, defence and home advantage for every team at once by maximum likelihood over 3+ seasons, weighting recent games more (half-life ≈ 1 year). Adjusts schedule strength automatically and corrects 0-0 / 1-1 frequencies.</dd>
+          <dt>ML Poisson (form + Elo)</dt>
+          <dd>Machine learning: Poisson regressions trained on thousands of past matches. Inputs are each side's last-5 goals, shots on target, points and the Elo gap. The model learns how much each signal is really worth.</dd>
+          <dt>Blend</dt>
+          <dd>Geometric mean of the models' expected goals. Ensembles are usually more reliable than any single model.</dd>
+        </dl>
+        <h3>Fixes vs the spreadsheet</h3>
+        <ul>
+          <li><b>Home Wins %</b> (B9) summed <code>H40:N40</code>, which skips the 1-0 cell (G40), so home-win chances were understated.</li>
+          <li><b>Under 3.5</b> (B18) omitted the 0-3 scoreline (F43).</li>
+          <li><b>American odds</b> used <code>(1/p − 1) × 100</code>, which is only correct for underdogs. Favourites are now negative (e.g. 70% → −233).</li>
+          <li>Correct-score labels like “1-1”, “1-2” had been auto-converted by Excel into dates (2023-01-01…).</li>
+          <li>The 20-branch <code>IFS</code> lookups are replaced by automatic lookups, so new or promoted teams just work.</li>
+        </ul>
+      </div>
+    </div>
+  </section>
+</main>
+
+<div id="toast" class="toast hidden"></div>
+<script src="/static/app.js"></script>
+</body>
+</html>
