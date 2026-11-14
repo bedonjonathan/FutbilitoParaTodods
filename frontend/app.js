@@ -12,16 +12,70 @@ const amer = (a) => (a == null ? "–" : a > 0 ? "+" + a : String(a));
 const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 const formChips = (s) => `<span class="form">${[...(s || "")].map((r) => `<span class="chip ${r}" title="${r === "W" ? "Win" : r === "D" ? "Draw" : "Loss"}">${r}</span>`).join("")}</span>`;
 
-async function api(path, opts) {
-  const sep = path.includes("?") ? "&" : "?";
-  const url = `/api/${path}${path.startsWith("players") || path.startsWith("player/") || path.startsWith("leagues") ? "" : `${sep}div=${state.div}${state.season ? `&season=${state.season}` : ""}`}`;
-  const r = await fetch(url, opts);
-  if (!r.ok) {
-    let msg = r.statusText;
-    try { msg = (await r.json()).detail || msg; } catch {}
-    throw new Error(msg);
+// All data is static JSON produced by backend/export.py (run by GitHub Actions).
+const jsonCache = {};
+async function getJSON(path, fresh = false) {
+  const v = fresh ? Date.now() : state.meta?.generated || Date.now();
+  if (!fresh && jsonCache[path]) return jsonCache[path];
+  const r = await fetch(`data/${path}?v=${v}`, { cache: fresh ? "no-store" : "default" });
+  if (!r.ok) throw new Error(r.status === 404 ? `No data published yet for ${path}` : r.statusText);
+  return (jsonCache[path] = await r.json());
+}
+const L = () => state.league;
+
+// ---- Poisson / Dixon-Coles maths (same as backend/models.py)
+const MAXG = 10;
+function poissonPmf(lam) {
+  const out = [Math.exp(-lam)];
+  for (let k = 1; k <= MAXG; k++) out.push(out[k - 1] * lam / k);
+  return out;
+}
+function americanOdds(p) {
+  if (!(p > 0 && p < 1)) return null;
+  return p >= 0.5 ? Math.round(-100 * p / (1 - p)) : Math.round(100 * (1 - p) / p);
+}
+const price = (p) => ({ p, decimal: p > 0 ? 1 / p : null, american: americanOdds(p) });
+function markets(lh, la, rho = 0) {
+  const ph = poissonPmf(lh), pa = poissonPmf(la);
+  const m = ph.map((x) => pa.map((y) => x * y));
+  if (rho) {
+    m[0][0] *= 1 - lh * la * rho; m[0][1] *= 1 + lh * rho; m[1][0] *= 1 + la * rho; m[1][1] *= 1 - rho;
   }
-  return r.json();
+  let tot = 0; m.forEach((r) => r.forEach((v, j) => { r[j] = Math.max(0, v); tot += r[j]; }));
+  m.forEach((r) => r.forEach((v, j) => (r[j] = v / tot)));
+  const sum = (f) => { let t = 0; m.forEach((r, h) => r.forEach((v, a) => { if (f(h, a)) t += v; })); return t; };
+  const lines = ["0.5", "1.5", "2.5", "3.5", "4.5"];
+  const flat = [];
+  for (let h = 0; h < 7; h++) for (let a = 0; a < 7; a++) flat.push([m[h][a], `${h}-${a}`]);
+  flat.sort((x, y) => y[0] - x[0]);
+  return {
+    lambda_home: lh, lambda_away: la, rho,
+    home: price(sum((h, a) => h > a)), draw: price(sum((h, a) => h === a)), away: price(sum((h, a) => h < a)),
+    btts_yes: price(sum((h, a) => h > 0 && a > 0)),
+    home_cs: price(sum((h, a) => a === 0)), away_cs: price(sum((h, a) => h === 0)),
+    over: Object.fromEntries(lines.map((t) => [t, price(sum((h, a) => h + a > +t))])),
+    under: Object.fromEntries(lines.map((t) => [t, price(sum((h, a) => h + a < +t))])),
+    home_goals_dist: m.slice(0, 7).map((r) => r.reduce((x, y) => x + y, 0)),
+    away_goals_dist: [0, 1, 2, 3, 4, 5, 6].map((a) => m.reduce((x, r) => x + r[a], 0)),
+    matrix: m.slice(0, 7).map((r) => r.slice(0, 7)),
+    top_scores: flat.slice(0, 8).map(([p, score]) => ({ score, ...price(p) })),
+  };
+}
+function implied(o) {
+  if (!o || o.some((x) => !(x > 0))) return null;
+  const inv = o.map((x) => 1 / x), t = inv.reduce((a, b) => a + b, 0);
+  return inv.map((x) => x / t);
+}
+function rolling(arr, w) {
+  return arr.map((_, i) => {
+    const sl = arr.slice(Math.max(0, i - w + 1), i + 1).filter((x) => x != null);
+    return sl.length ? sl.reduce((a, b) => a + b, 0) / sl.length : null;
+  });
+}
+function workflowUrl() {
+  const m = location.hostname.match(/^([^.]+)\.github\.io$/);
+  const repo = location.pathname.split("/").filter(Boolean)[0];
+  return m && repo ? `https://github.com/${m[1]}/${repo}/actions/workflows/pages.yml` : null;
 }
 function toast(msg, ms = 3500) {
   const t = $("#toast"); t.textContent = msg; t.classList.remove("hidden");
@@ -30,7 +84,7 @@ function toast(msg, ms = 3500) {
 function stamp(ts) {
   if (!ts) return "";
   const d = new Date(ts * 1000);
-  return `Data updated ${d.toLocaleDateString()} ${d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}`;
+  return `Updated ${d.toLocaleDateString()} ${d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}`;
 }
 
 // ------------------------------------------------------------------ chart base
@@ -68,8 +122,10 @@ const noGrid = (extra = {}) => ({ grid: { display: false }, border: { color: css
 // ------------------------------------------------------------------ boot
 async function boot() {
   chartDefaults();
-  const meta = await api("leagues");
+  const meta = await getJSON("index.json", true);
   state.meta = meta;
+  const wf = workflowUrl();
+  if (wf) { $("#updateNow").href = wf; $("#updateNow").classList.remove("hidden"); }
   $("#league").innerHTML = meta.leagues.map((l) => `<option value="${l.code}">${esc(l.name)} · ${esc(l.country)}</option>`).join("");
   $("#season").innerHTML = meta.seasons.map((s) => `<option value="${s.code}">${s.label}</option>`).join("");
   $("#modelSelect").innerHTML = Object.entries(meta.models).map(([k, v]) => `<option value="${k}" ${k === "blend" ? "selected" : ""}>${esc(v)}</option>`).join("");
@@ -130,10 +186,17 @@ function showTab(tab) {
 async function refresh() {
   const b = $("#refresh"); b.disabled = true; b.classList.add("busy");
   try {
-    const r = await api("refresh", { method: "POST" });
-    toast(`Refreshed · ${r.matches} matches this season`);
-    state.playersLoaded = false; state.players = null;
-    await loadLeague();
+    const prev = state.meta.generated;
+    const meta = await getJSON("index.json", true);
+    if (meta.generated === prev) {
+      toast("You already have the latest data. It updates automatically every 6 hours" + (workflowUrl() ? " — or use “Update now”." : "."), 6000);
+    } else {
+      for (const k in jsonCache) delete jsonCache[k];
+      state.meta = meta; state.players = null; state.playerHistAll = null;
+      jsonCache["index.json"] = meta;
+      await loadLeague();
+      toast("Loaded the newest data");
+    }
   } catch (e) { toast("Refresh failed: " + e.message, 6000); }
   finally { b.disabled = false; b.classList.remove("busy"); }
 }
@@ -142,16 +205,18 @@ async function loadLeague() {
   $("#dataStamp").textContent = "Loading…";
   Object.assign(state, { team: null, prediction: null, fixtures: null, backtest: null });
   try {
-    const o = await api("overview");
-    state.overview = o;
-    $("#dataStamp").textContent = `${o.league.name} ${o.season_label} · ${o.stats.matches || 0} matches · ${stamp(o.updated)}`;
+    const key = `${state.div}_${state.season}`;
+    if (!state.meta.available.includes(key)) throw new Error("This league/season isn't published yet.");
+    const o = await getJSON(`${key}.json`);
+    state.league = o; state.overview = o;
+    $("#dataStamp").textContent = `${o.league.name} ${o.season_label} · ${o.stats.matches || 0} matches · ${stamp(state.meta.generated)}`;
     const opts = o.teams.map((t) => `<option>${esc(t)}</option>`).join("");
     const keepTeam = $("#teamSelect").value;
     $("#teamSelect").innerHTML = opts;
     if (o.teams.includes(keepTeam)) $("#teamSelect").value = keepTeam; else $("#teamSelect").value = o.table[0]?.team;
     $("#homeSelect").innerHTML = opts; $("#awaySelect").innerHTML = opts;
     $("#homeSelect").value = o.table[0]?.team; $("#awaySelect").value = o.table[1]?.team;
-    const playersOk = o.league.players && state.season === state.meta.current_season;
+    const playersOk = o.league.players && state.season === state.meta.current_season && state.meta.players;
     $("#playersUnavailable").classList.toggle("hidden", playersOk);
     $("#playersBody").classList.toggle("hidden", !playersOk);
     renderOverview(o);
@@ -260,10 +325,19 @@ function renderTable() {
 // ------------------------------------------------------------------ team
 async function loadTeam() {
   const team = $("#teamSelect").value; if (!team) return;
-  try {
-    state.team = await api(`team?team=${encodeURIComponent(team)}&window=${$("#teamWindow").value}`);
-    renderTeam(state.team);
-  } catch (e) { toast(e.message); }
+  const w = +$("#teamWindow").value;
+  const raw = L().series[team] || [];
+  const roll = (k) => rolling(raw.map((m) => m[k]), w);
+  const cols = ["gf", "ga", "xgf", "xga", "pts", "sotf", "sota"];
+  const rolled = Object.fromEntries(cols.map((k) => [k, roll(k)]));
+  const series = raw.map((m, i) => ({ ...m, ...Object.fromEntries(cols.map((k) => [k + "_roll", rolled[k][i]])) }));
+  const lastW = raw.slice(-w);
+  const avg = (k) => (lastW.length ? lastW.reduce((a, m) => a + (m[k] ?? 0), 0) / lastW.length : null);
+  state.team = {
+    team, series, dc: L().dc_ratings.find((r) => r.team === team), elo: L().elo.find((r) => r.team === team)?.elo,
+    form: { gf_f: avg("gf"), ga_f: avg("ga"), pts_f: avg("pts") },
+  };
+  renderTeam(state.team);
 }
 function renderTeam(t) {
   const s = t.series, w = $("#teamWindow").value;
@@ -318,12 +392,29 @@ async function loadPrediction() {
   if (!h || !a) return;
   if (h === a) { $("#predictOut").innerHTML = `<div class="card"><p>Pick two different teams.</p></div>`; return; }
   $("#predictOut").innerHTML = `<div class="card loading">Crunching…</div>`;
-  loadPrediction.busy = true;
-  try {
-    state.prediction = await api(`predict?home=${encodeURIComponent(h)}&away=${encodeURIComponent(a)}`);
-    renderPrediction(state.prediction);
-  } catch (e) { $("#predictOut").innerHTML = `<div class="card">${esc(e.message)}</div>`; }
-  finally { loadPrediction.busy = false; }
+  const lg = L(), lams = lg.pairs[`${h}|${a}`] || {};
+  const mods = {};
+  for (const k of Object.keys(state.meta.models)) {
+    const l = lams[k];
+    mods[k] = l ? markets(l[0], l[1], k === "dc" || k === "blend" ? lg.rho : 0) : null;
+  }
+  const fx = (lg.fixtures || []).find((f) => f.home === h && f.away === a && f.odds);
+  let scorers = null;
+  if (lg.scorers && mods.blend) {
+    const sc = (team, lam) => (lg.scorers[team] || []).map((p) => ({ ...p, p_score: 1 - Math.exp(-lam * p.share * p.availability) }))
+      .sort((x, y) => y.p_score - x.p_score).slice(0, 8);
+    scorers = { home: sc(h, mods.blend.lambda_home), away: sc(a, mods.blend.lambda_away) };
+  }
+  const eloOf = (t) => lg.elo.find((r) => r.team === t)?.elo;
+  state.prediction = {
+    home: h, away: a, models: mods, model_names: state.meta.models,
+    h2h: lg.h2h[`${h}|${a}`] || lg.h2h[`${a}|${h}`] || [],
+    form: { home: (lg.series[h] || []).slice(-5), away: (lg.series[a] || []).slice(-5) },
+    elo: { home: eloOf(h), away: eloOf(a) },
+    market: fx ? { odds: fx.odds, implied: fx.market_p } : null,
+    scorers,
+  };
+  renderPrediction(state.prediction);
 }
 
 function renderPrediction(P) {
@@ -426,11 +517,8 @@ function renderPrediction(P) {
 
 // ------------------------------------------------------------------ fixtures
 async function loadFixtures() {
-  $("#fixturesOut").innerHTML = `<div class="loading">Loading fixtures…</div>`;
-  try {
-    state.fixtures = await api("fixtures?limit=30");
-    renderFixtures(state.fixtures);
-  } catch (e) { $("#fixturesOut").innerHTML = esc(e.message); }
+  state.fixtures = { fixtures: (L().fixtures || []).slice(0, 30) };
+  renderFixtures(state.fixtures);
 }
 function renderFixtures(F) {
   if (!F.fixtures.length) { $("#fixturesOut").innerHTML = `<p class="muted">No upcoming fixtures in the free feed for this league right now (international break, or the feed only lists this weekend's games). Use the Match Predictor for any pairing.</p>`; return; }
@@ -454,7 +542,7 @@ function renderFixtures(F) {
 async function loadPlayers() {
   if (!(state.overview?.league.players)) return;
   try {
-    state.players = await api("players");
+    state.players = await getJSON("players.json");
     $("#pTeam").innerHTML = `<option value="">All teams</option>` + state.players.teams.map((t) => `<option>${esc(t)}</option>`).join("");
     state.pSort = { key: "xg", asc: false };
     renderPlayers();
@@ -501,7 +589,10 @@ function renderPlayers() {
 async function loadPlayer(id) {
   const p = state.players.players.find((x) => x.id === id);
   try {
-    const h = await api(`player/${id}`);
+    const all = state.playerHistAll || (state.playerHistAll = await getJSON("player_history.json"));
+    const rows = all.players[id];
+    if (!rows) { toast("No game-by-game history published for this player"); return; }
+    const h = { history: rows.map((r) => Object.fromEntries(all.fields.map((f, i) => [f, r[i]]))) };
     state.playerHist = [p, h];
     renderPlayerChart(p, h);
   } catch (e) { toast(e.message); }
@@ -525,10 +616,9 @@ function renderPlayerChart(p, h) {
 // ------------------------------------------------------------------ model lab
 async function loadBacktest() {
   $("#btOut").className = "loading"; $("#btOut").textContent = "Running backtest… (takes a few seconds the first time)";
-  try {
-    state.backtest = await api("backtest");
-    renderBacktest(state.backtest);
-  } catch (e) { $("#btOut").textContent = e.message; }
+  state.backtest = L().backtest;
+  if (state.backtest) renderBacktest(state.backtest);
+  else $("#btOut").textContent = "Backtest not available for this league/season yet.";
 }
 function renderBacktest(B) {
   $("#btSeason").textContent = `(${B.season_label})`;

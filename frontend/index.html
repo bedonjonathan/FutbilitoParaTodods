@@ -6,7 +6,7 @@
 <title>Futbolito Analytics</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
-<link rel="stylesheet" href="/static/styles.css">
+<link rel="stylesheet" href="styles.css">
 <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
 </head>
 <body>
@@ -21,9 +21,10 @@
   <div class="controls">
     <label>League <select id="league"></select></label>
     <label>Season <select id="season"></select></label>
-    <button id="refresh" class="btn primary" title="Download the latest results, odds and player data">
+    <button id="refresh" class="btn primary" title="Load the newest published data">
       <span class="spin" aria-hidden="true">↻</span> Refresh data
     </button>
+    <a id="updateNow" class="btn ghost hidden" target="_blank" rel="noopener" title="Open GitHub and click “Run workflow” to rebuild the data right now (takes ~10 min)">Update now ↗</a>
     <button id="themeToggle" class="btn ghost" title="Toggle light / dark" aria-label="Toggle light / dark">☾ Theme</button>
   </div>
 </header>
@@ -204,6 +205,6 @@
 </main>
 
 <div id="toast" class="toast hidden"></div>
-<script src="/static/app.js"></script>
+<script src="app.js"></script>
 </body>
 </html>

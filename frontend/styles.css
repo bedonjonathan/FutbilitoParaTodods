@@ -193,3 +193,5 @@ table.sortable th.sorted.asc::after { content: " ▴"; }
   .match-hero .team { font-size: 16px; }
   .match-hero .xg { font-size: 26px; }
 }
+
+a.btn { text-decoration: none; }

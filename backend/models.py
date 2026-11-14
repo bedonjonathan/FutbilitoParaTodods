@@ -118,8 +118,8 @@ def sheet_lambdas(season_df: pd.DataFrame, home: str, away: str, min_games: int 
 
 # --------------------------------------------------------------------------- form5
 def form_lambdas(history: pd.DataFrame, season_df: pd.DataFrame, home: str, away: str,
-                 window: int = 5, xg_weight: float = 0.5):
-    long = analytics.team_matches(history)
+                 window: int = 5, xg_weight: float = 0.5, long: pd.DataFrame | None = None):
+    long = analytics.team_matches(history) if long is None else long
     th = long[long.team == home].tail(window)
     ta = long[long.team == away].tail(window)
     if len(th) < 3 or len(ta) < 3:
@@ -243,11 +243,11 @@ class FormML:
         X = X[ML_FEATURES].fillna(self.fill)
         return np.column_stack([self.home_model.predict(X), self.away_model.predict(X)])
 
-    def lambdas_for(self, history: pd.DataFrame, home: str, away: str, elo: dict):
+    def lambdas_for(self, history: pd.DataFrame, home: str, away: str, elo: dict, long=None):
         if home not in elo or away not in elo:
             return None
-        fh = analytics.latest_form(history, home)
-        fa = analytics.latest_form(history, away)
+        fh = analytics.latest_form(history, home, long=long)
+        fa = analytics.latest_form(history, away, long=long)
         row = {"elo_diff": (elo[home] - elo[away]) / 100.0}
         row |= {f"h_{k}": v for k, v in fh.items()}
         row |= {f"a_{k}": v for k, v in fa.items()}

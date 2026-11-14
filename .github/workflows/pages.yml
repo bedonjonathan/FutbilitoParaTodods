@@ -1,0 +1,52 @@
+name: Update data & publish site
+
+on:
+  schedule:
+    - cron: "17 */6 * * *"   # every 6 hours
+  workflow_dispatch:          # "Run workflow" button = update now
+  push:
+    branches: [claude/gifted-newton-4rhrne, main]
+    paths: ["backend/**", "frontend/**", ".github/workflows/pages.yml", "requirements.txt"]
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      # past seasons never change, so keep downloaded CSVs between runs
+      - uses: actions/cache@v4
+        with:
+          path: data/cache
+          key: data-cache-${{ github.run_id }}
+          restore-keys: data-cache-
+      - run: pip install -r requirements.txt
+      - name: Download data, fit models, write JSON
+        run: python -m backend.export --out site
+      - uses: actions/configure-pages@v5
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4

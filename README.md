@@ -4,16 +4,30 @@ A local web app that pulls **free** football data automatically, shows it with c
 predicts matches using your spreadsheet's Poisson method plus three stronger models,
 including a machine-learning model built on each team's **last 5 games**.
 
-## Run it
+## It's a website: no commands needed
 
+The site is hosted free on **GitHub Pages**:
+**https://bedonjonathan.github.io/FutbilitoParaTodods/**
+
+How it works: GitHub Pages can only serve static files, and the football data sites don't
+allow browser pages to fetch from them directly. So a **GitHub Action**
+(`.github/workflows/pages.yml`) runs on GitHub's computers **every 6 hours**. It downloads
+the latest data, fits every model, writes the results as JSON files and publishes the site.
+Your browser just reads those files; the predictor maths runs in the page.
+
+* **Refresh data** (in the app) loads the newest published data.
+* **Update now ↗** opens the workflow on GitHub; click **Run workflow** to rebuild right
+  away (about 10 minutes).
+
+### One-time setup
+In the repo: **Settings → Pages → Build and deployment → Source: "GitHub Actions"**.
+Then open the **Actions** tab, pick *Update data & publish site* and click **Run workflow**.
+
+### Optional: run it locally
 ```bash
 pip install -r requirements.txt
-python run.py            # opens http://localhost:8000
+python run.py --leagues E0     # build Premier League data and open http://localhost:8000
 ```
-
-Click **Refresh data** at any time to download the latest results, odds and player stats.
-Data is cached in `data/cache/`. The current season also refreshes itself if the cache is
-more than 6 hours old, and past seasons are downloaded once.
 
 ## Data sources (free, no API key)
 
@@ -67,8 +81,9 @@ backend/
   analytics.py  tables, rolling form, Elo, pre-match ML features
   models.py     sheet / form5 / Dixon-Coles / ML models + market maths
   engine.py     fits models per league, walk-forward backtest
-  app.py        FastAPI JSON API (/api/...) + serves the UI
-frontend/       index.html, styles.css, app.js (Chart.js)
+  export.py     builds the static site: writes site/data/*.json + copies the UI
+frontend/       index.html, styles.css, app.js (Chart.js + Poisson maths in JS)
+.github/workflows/pages.yml   scheduled build + deploy to GitHub Pages
 ```
 
 ## Ideas for next steps
@@ -78,4 +93,3 @@ frontend/       index.html, styles.css, app.js (Chart.js)
   card rates, corners and cards markets.
 * **Gradient boosting**: try gradient-boosted models and tune the decay/form window using the Model Lab.
 * **History**: store predictions in SQLite to track real-world accuracy and profit/loss over time.
-* **Scheduling**: refresh automatically every morning.

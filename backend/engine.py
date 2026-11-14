@@ -25,6 +25,7 @@ class LeagueContext:
         self.teams = sorted(set(self.season_df.home) | set(self.season_df.away))
         hist = self.history.reset_index(drop=True)
         self.history = hist
+        self.long = analytics.team_matches(hist)
         self.feats = analytics.prematch_features(hist)
         _, self.elo = analytics.elo_ratings(hist)
         self.dc = models.DixonColes().fit(hist)
@@ -34,9 +35,9 @@ class LeagueContext:
     def lambdas(self, home: str, away: str) -> dict[str, tuple[float, float] | None]:
         out = {
             "sheet": models.sheet_lambdas(self.season_df, home, away),
-            "form5": models.form_lambdas(self.history, self.season_df, home, away),
+            "form5": models.form_lambdas(self.history, self.season_df, home, away, long=self.long),
             "dc": self.dc.lambdas(home, away),
-            "ml": self.ml.lambdas_for(self.history, home, away, self.elo),
+            "ml": self.ml.lambdas_for(self.history, home, away, self.elo, long=self.long),
         }
         out["blend"] = _blend(out)
         return out

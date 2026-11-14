@@ -128,9 +128,9 @@ def prematch_features(df: pd.DataFrame, window: int = 5) -> pd.DataFrame:
     return out
 
 
-def latest_form(df: pd.DataFrame, team: str, window: int = 5) -> dict:
+def latest_form(df: pd.DataFrame, team: str, window: int = 5, long: pd.DataFrame | None = None) -> dict:
     """Feature vector for a team's *next* match (average of its last `window` games)."""
-    long = team_matches(df)
+    long = team_matches(df) if long is None else long
     t = long[long.team == team].tail(window)
     if t.empty:
         return {f"{c}_f": np.nan for c in FORM_STATS} | {"n_prev": 0}
