@@ -189,7 +189,7 @@ async function refresh() {
     const prev = state.meta.generated;
     const meta = await getJSON("index.json", true);
     if (meta.generated === prev) {
-      toast("You already have the latest data. It updates automatically every 6 hours" + (workflowUrl() ? " — or use “Update now”." : "."), 6000);
+      toast("You already have the latest data. It updates automatically every Thursday" + (workflowUrl() ? " — or use “Update now”." : "."), 6000);
     } else {
       for (const k in jsonCache) delete jsonCache[k];
       state.meta = meta; state.players = null; state.playerHistAll = null;

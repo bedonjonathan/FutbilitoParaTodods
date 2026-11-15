@@ -11,12 +11,12 @@ The site is hosted free on **GitHub Pages**:
 
 How it works: GitHub Pages can only serve static files, and the football data sites don't
 allow browser pages to fetch from them directly. So a **GitHub Action**
-(`.github/workflows/pages.yml`) runs on GitHub's computers **every 6 hours**. It downloads
+(`.github/workflows/pages.yml`) runs on GitHub's computers **every Thursday** (12:43 UTC), the day before the match week starts. It downloads
 the latest data, fits every model, writes the results as JSON files and publishes the site.
 Your browser just reads those files; the predictor maths runs in the page.
 
 * **Refresh data** (in the app) loads the newest published data.
-* **Update now ↗** opens the workflow on GitHub; click **Run workflow** to rebuild right
+* **Update now ↗** opens the workflow on GitHub; click **Run workflow** to rebuild any time
   away (about 10 minutes).
 
 ### One-time setup
