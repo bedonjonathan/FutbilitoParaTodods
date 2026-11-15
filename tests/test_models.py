@@ -84,3 +84,38 @@ def test_walk_forward_never_sees_the_future(league):
     by = {r["model"]: r for r in rows}
     assert by["dc"]["log_loss"] < 1.0986          # better than a coin-flip between three outcomes
     assert all(0 <= r["accuracy"] <= 1 for r in rows)
+
+
+def test_backtest_reuses_unchanged_weeks(league):
+    """A rebuild with the same data gives identical results and recomputes nothing;
+    adding a new week recomputes only that week."""
+    feats = analytics.prematch_features(league)
+    cache = {}
+    first, w1 = engine.walk_forward(league, feats, ["2627"], cache=cache)
+    saved = dict(cache)
+    again, w2 = engine.walk_forward(league, feats, ["2627"], cache=cache)
+    assert all(cache[k] is saved[k] for k in saved)           # nothing recomputed
+    assert engine.score(first) == engine.score(again) and w1 == pytest.approx(w2)
+
+    last_week = league.date.max().to_period("W")
+    shorter = league[league.date.dt.to_period("W") < last_week]
+    cache2 = {}
+    engine.walk_forward(shorter, feats.loc[shorter.index], ["2627"], cache=cache2)
+    before = dict(cache2)
+    engine.walk_forward(league, feats, ["2627"], cache=cache2)
+    changed = [k for k in cache2 if before.get(k) is not cache2[k]]
+    assert changed == [str(last_week)]
+
+
+def test_a_corrected_result_invalidates_that_week_and_later(league):
+    feats = analytics.prematch_features(league)
+    cache = {}
+    engine.walk_forward(league, feats, ["2627"], cache=cache)
+    before = dict(cache)
+    fixed = league.copy()
+    i = fixed.index[fixed.season == "2627"][100]
+    fixed.loc[i, "hg"] += 3                                   # the source corrects a score
+    engine.walk_forward(fixed, analytics.prematch_features(fixed), ["2627"], cache=cache)
+    changed = sorted(k for k in cache if before.get(k) is not cache[k])
+    wk = str(fixed.loc[i, "date"].to_period("W"))
+    assert changed[0] == wk and changed == sorted(k for k in cache if k >= wk)

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import hashlib
 import json
 import math
 import shutil
@@ -161,8 +162,29 @@ def scorer_shares(ctx, fpl: dict, recent_minutes: dict[int, float]) -> dict:
     return out
 
 
+def inputs_key(div: str, season: str) -> str:
+    """Fingerprint of everything a finished season's page is built from: the code and
+    the saved results files for that season and the three before it (the model history)."""
+    h = hashlib.sha256(engine.CODE_VERSION.encode() + Path(__file__).read_bytes())
+    for s in [season] + sources.previous_seasons(season, 3):
+        f = sources.CACHE_DIR / f"{div}_{s}.csv"
+        h.update(s.encode() + (f.read_bytes() if f.exists() else b"-"))
+    return h.hexdigest()[:20]
+
+
 def export_league(div: str, season: str, out: Path, fx_csv, fpl, recent_minutes, is_active: bool) -> None:
     t0 = time.time()
+    path = out / "data" / f"{div}_{season}.json"
+    key = None
+    if not is_active:
+        # A finished season's page only changes if its data or the code changed: reuse it.
+        key = inputs_key(div, season)
+        try:
+            if json.loads(path.read_text()).get("build_key") == key:
+                print(f"  {div} {season}: unchanged, kept as is")
+                return
+        except Exception:
+            pass
     ctx = engine.get_context(div, season)
     s = ctx.season_df
     if not len(s):
@@ -209,14 +231,14 @@ def export_league(div: str, season: str, out: Path, fx_csv, fpl, recent_minutes,
         "series": {t: analytics.team_series(s, t, 5) for t in teams}, "pairs": pairs, "h2h": h2h,
         "fixtures": upcoming(ctx, fx_csv, fpl) if is_active else [],
         "scorers": scorer_shares(ctx, fpl, recent_minutes) if (is_active and fpl) else None,
-        "backtest": bt,
+        "backtest": bt, "build_key": key,
     }
-    write(out / "data" / f"{div}_{season}.json", payload)
+    write(path, payload)
     print(f"  {div} {season}: {len(s)} matches, {len(teams)} teams in {time.time() - t0:.1f}s")
 
 
 # --------------------------------------------------------------------------- players
-def export_players(out: Path, bootstrap: dict, with_history: bool = True) -> tuple[int, dict[int, float]]:
+def export_players(out: Path, bootstrap: dict, fixtures: list[dict], with_history: bool = True) -> tuple[int, dict[int, float]]:
     teams = {t["id"]: t["name"] for t in bootstrap["teams"]}
     rows = []
     for p in bootstrap["elements"]:
@@ -237,31 +259,56 @@ def export_players(out: Path, bootstrap: dict, with_history: bool = True) -> tup
 
     hist, recent = {}, {}
     if with_history:
-        # only players with regular minutes, to keep the number of requests modest
-        ids = [r["id"] for r in rows if r["minutes"] >= 180]
-        failed = 0
-        for pid in ids:
-            try:
-                h = sources.fpl_player_history(pid, force=True)
-            except Exception:
-                failed += 1
+        try:
+            games_by_player = sources.fpl_player_histories(bootstrap, fixtures)
+        except Exception as e:
+            warn(f"players: game-by-game history unavailable ({e})")
+            games_by_player = {}
+        active = {r["id"] for r in rows}
+        for pid, games in games_by_player.items():
+            if pid not in active:
                 continue
-            games = h.get("history", [])
-            hist[pid] = [[g["round"], g["minutes"], g["goals_scored"], g["assists"],
-                          float(g["expected_goals"]), float(g["expected_assists"]), g["total_points"],
-                          teams.get(g["opponent_team"], "?"), g["was_home"]]
-                         for g in games[-10:]]
-            if games:
-                last = games[-5:]
-                recent[pid] = sum(g["minutes"] for g in last) / len(last)
-            time.sleep(0.15)  # be polite to the FPL API
-        if failed:
-            warn(f"players: game-by-game history failed for {failed} of {len(ids)} players")
+            played = [g for g in games if g["minutes"] > 0]
+            if played:
+                hist[pid] = [[g["round"], g["minutes"], g["goals"], g["assists"], g["xg"], g["xa"], g["points"],
+                              " + ".join(teams.get(t, "?") for t in g["opponents"]) or "?", g["home"]]
+                             for g in played]
+            last = games[-5:]       # last 5 completed gameweeks (0 minutes counts: benched/injured)
+            recent[pid] = sum(g["minutes"] for g in last) / len(last)
     write(out / "data" / "player_history.json", {
         "fields": ["round", "minutes", "goals", "assists", "xg", "xa", "points", "opponent", "home"],
         "players": hist})
     print(f"  players: {len(rows)} ({len(hist)} with history)")
     return len(rows), recent
+
+
+# --------------------------------------------------------------------------- restore
+def restore_published(base_url: str, out: Path) -> None:
+    """Copy the currently published data pages from our own live site into `out` (only
+    those not already there). This makes last week's pages available as a fallback even
+    when GitHub has cleared the build cache. Never touches the football data sources."""
+    import httpx
+    base = base_url.rstrip("/") + "/data/"
+    try:
+        with httpx.Client(timeout=30, follow_redirects=True) as c:
+            r = c.get(base + "index.json")
+            if r.status_code != 200:
+                print(f"restore: no published site yet ({r.status_code})")
+                return
+            index = r.json()
+            got = 0
+            for key in index.get("available", []):
+                dest = out / "data" / f"{key}.json"
+                if dest.exists():
+                    continue
+                rr = c.get(base + f"{key}.json")
+                if rr.status_code == 200:
+                    dest.parent.mkdir(parents=True, exist_ok=True)
+                    dest.write_bytes(rr.content)
+                    got += 1
+            print(f"restore: {got} published pages copied from the live site")
+    except Exception as e:
+        print(f"restore: skipped ({e})")
 
 
 # --------------------------------------------------------------------------- main
@@ -271,8 +318,13 @@ def main(argv=None) -> None:
     ap.add_argument("--leagues", nargs="*", default=list(sources.LEAGUES))
     ap.add_argument("--seasons", type=int, default=2, help="current season + N-1 previous")
     ap.add_argument("--no-player-history", action="store_true")
+    ap.add_argument("--restore-from", metavar="URL",
+                    help="the live site; pages missing locally are fetched from it first, so a "
+                         "league whose download fails can fall back to last week's page")
     a = ap.parse_args(argv)
     out = Path(a.out)
+    if a.restore_from:
+        restore_published(a.restore_from, out)
 
     # copy the UI
     out.mkdir(parents=True, exist_ok=True)
@@ -294,7 +346,7 @@ def main(argv=None) -> None:
 
     n_players, recent_minutes = 0, {}
     if fpl:
-        n_players, recent_minutes = export_players(out, fpl["bootstrap"], with_history=not a.no_player_history)
+        n_players, recent_minutes = export_players(out, fpl["bootstrap"], fpl["fixtures"], with_history=not a.no_player_history)
 
     index = {"generated": time.time(), "models": models.MODEL_NAMES, "leagues": [], "available": [],
              "default_season": {}, "kept_from_previous_build": [], "players": n_players > 0}
@@ -337,6 +389,9 @@ def main(argv=None) -> None:
     if required not in index["default_season"]:
         print(f"::error::No data could be built for {required}; not publishing.")
         sys.exit(1)
+    t = sources.TRAFFIC
+    print(f"data sources: {t['requests']} requests, {t['not_modified']} answered 'not modified', "
+          f"{t['bytes'] / 1e6:.1f} MB downloaded")
     print(f"done -> {out}  ({len(index['available'])} league-seasons, {len(WARNINGS)} warnings)")
 
 

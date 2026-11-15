@@ -37,9 +37,10 @@ jobs:
       - name: Tests (a failure here stops the publish, so the last good site stays up)
         run: python -m pytest -q
 
-      # Finished seasons never change, so downloaded files are kept between runs.
-      # The last published data is kept too: if a league's download fails this week,
-      # last week's page for it is re-published instead of disappearing.
+      # Saved between runs: downloaded data files, the model test's finished weeks and the
+      # published pages. So each Thursday only asks the sources for what is new, only the
+      # new week is computed, and finished seasons are reused. (keep-cache.yml stops GitHub
+      # from deleting this cache, which it does after 7 days without use.)
       - if: github.event_name != 'pull_request'
         uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830             # v4
         with:
@@ -49,12 +50,15 @@ jobs:
           key: data-v2-${{ github.run_id }}
           restore-keys: data-v2-
 
-      - name: Download data, fit models, write JSON
+      - id: pages
         if: github.event_name != 'pull_request'
-        run: python -m backend.export --out site
-
-      - if: github.event_name != 'pull_request'
         uses: actions/configure-pages@983d7736d9b0ae728b81ab479565c72886d7745b   # v5
+
+      # --restore-from: if the cache was lost anyway, last week's pages are copied from the
+      # live site first, so a failed download still falls back to them.
+      - name: Download new data, fit models, write JSON
+        if: github.event_name != 'pull_request'
+        run: python -m backend.export --out site --restore-from "${{ steps.pages.outputs.base_url }}"
       - if: github.event_name != 'pull_request'
         uses: actions/upload-pages-artifact@56afc609e74202658d3ffba0e8f6dda462b719fa  # v3
         with:
@@ -67,7 +71,9 @@ jobs:
         continue-on-error: true
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh api -X PUT "repos/$GITHUB_REPOSITORY/actions/workflows/pages.yml/enable"
+        run: |
+          gh api -X PUT "repos/$GITHUB_REPOSITORY/actions/workflows/pages.yml/enable"
+          gh api -X PUT "repos/$GITHUB_REPOSITORY/actions/workflows/keep-cache.yml/enable"
 
   deploy:
     if: github.event_name != 'pull_request'

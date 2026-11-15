@@ -107,21 +107,53 @@ def season_label(season: str) -> str:
 
 
 # --------------------------------------------------------------------------- http + cache
-def _get(url: str) -> bytes:
+# what this run asked the data sources for (printed at the end of a build)
+TRAFFIC = {"requests": 0, "not_modified": 0, "bytes": 0}
+
+
+def _get(url: str, headers: dict | None = None) -> tuple[bytes | None, dict]:
+    """GET a URL. Returns (content, validators); content is None when the server
+    answered 304 Not Modified, i.e. our saved copy is still current."""
     with httpx.Client(headers=HEADERS, follow_redirects=True, timeout=30) as c:
-        r = c.get(url)
+        r = c.get(url, headers=headers or {})
+        TRAFFIC["requests"] += 1
+        if r.status_code == 304:
+            TRAFFIC["not_modified"] += 1
+            return None, {}
         r.raise_for_status()
-        return r.content
+        TRAFFIC["bytes"] += len(r.content)
+        return r.content, {k: r.headers[k] for k in ("etag", "last-modified") if k in r.headers}
+
+
+def _meta_path(path: Path) -> Path:
+    return path.with_name(path.name + ".meta.json")
 
 
 def _cached(name: str, url: str, force: bool, max_age: float | None, validate=None) -> bytes:
+    """Return a saved copy if it is fresh enough; otherwise ask the source for a new one
+    *only if it changed* (If-Modified-Since / If-None-Match), so an unchanged file costs
+    one tiny request and no download."""
     path = CACHE_DIR / name
     if path.exists() and not force:
         age = time.time() - path.stat().st_mtime
         if max_age is None or age < max_age:
             return path.read_bytes()
+    cond = {}
+    if path.exists() and _meta_path(path).exists():
+        try:
+            meta = json.loads(_meta_path(path).read_text())
+            if meta.get("etag"):
+                cond["If-None-Match"] = meta["etag"]
+            if meta.get("last-modified"):
+                cond["If-Modified-Since"] = meta["last-modified"]
+        except Exception:
+            pass
     try:
-        data = _get(url)
+        data, validators = _get(url, cond)
+        if data is None:                       # 304: unchanged since we saved it
+            STALE_SERVED.discard(name)
+            path.touch()                       # mark as checked just now
+            return path.read_bytes()
         if validate is not None:
             validate(data)
     except Exception:
@@ -131,6 +163,10 @@ def _cached(name: str, url: str, force: bool, max_age: float | None, validate=No
         raise
     STALE_SERVED.discard(name)
     path.write_bytes(data)
+    if validators:
+        _meta_path(path).write_text(json.dumps(validators))
+    elif _meta_path(path).exists():
+        _meta_path(path).unlink()
     return data
 
 
@@ -242,10 +278,44 @@ def fpl_fixtures(force: bool = False) -> list[dict]:
     return json.loads(_cached("fpl_fixtures.json", f"{FPL}/fixtures/", force, STALE_AFTER))
 
 
-def fpl_player_history(player_id: int, force: bool = False) -> dict:
-    return json.loads(_cached(
-        f"fpl_player_{int(player_id)}.json", f"{FPL}/element-summary/{int(player_id)}/", force, STALE_AFTER
-    ))
+def fpl_gameweek(gw: int) -> dict:
+    """Every player's stats for one gameweek, in a single request. A gameweek whose
+    data FPL has marked as final never changes, so it is downloaded exactly once."""
+    return json.loads(_cached(f"fpl_gw_{int(gw)}.json", f"{FPL}/event/{int(gw)}/live/", False, None))
+
+
+def fpl_player_histories(bootstrap: dict, fixtures: list[dict], last_n: int = 10) -> dict[int, list[dict]]:
+    """Per-player game-by-game stats for the last `last_n` completed gameweeks, built
+    from the per-gameweek files (1 request per new gameweek instead of 1 per player)."""
+    done = [e["id"] for e in bootstrap.get("events", []) if e.get("finished") and e.get("data_checked")]
+    done = sorted(done)[-last_n:]
+    team_of = {p["id"]: p["team"] for p in bootstrap["elements"]}
+    fx = {f["id"]: f for f in fixtures}
+    out: dict[int, list[dict]] = {}
+    for gw in done:
+        try:
+            live = fpl_gameweek(gw)
+        except Exception:
+            continue
+        for e in live.get("elements", []):
+            st = e["stats"]
+            pid = e["id"]
+            opp, home = [], None
+            for ex in e.get("explain", []):        # 2 entries in a double gameweek
+                f = fx.get(ex["fixture"])
+                if not f:
+                    continue
+                mine = team_of.get(pid)
+                if mine == f["team_h"]:
+                    opp.append(f["team_a"]); home = True if home is None else home
+                elif mine == f["team_a"]:
+                    opp.append(f["team_h"]); home = False if home is None else home
+            out.setdefault(pid, []).append({
+                "round": gw, "minutes": st["minutes"], "goals": st["goals_scored"], "assists": st["assists"],
+                "xg": float(st["expected_goals"]), "xa": float(st["expected_assists"]),
+                "points": st["total_points"], "opponents": opp, "home": home,
+            })
+    return out
 
 
 def match_team(name: str, known: set[str]) -> str | None:

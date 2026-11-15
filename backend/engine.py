@@ -2,13 +2,30 @@
 Fitted contexts are memoised until the data is refreshed."""
 from __future__ import annotations
 
+import hashlib
+import json
 import threading
 import time
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
 
 from . import analytics, models, sources
+
+# Changes whenever the model code changes, so saved results from older code are never reused.
+CODE_VERSION = hashlib.sha256(b"".join(
+    (Path(__file__).parent / f).read_bytes() for f in ("analytics.py", "models.py", "engine.py")
+)).hexdigest()[:16]
+_FP_COLS = ["date", "season", "home", "away", "hg", "ag", "hs", "as", "hst", "ast",
+            "hxg", "axg", "odds_h", "odds_d", "odds_a"]
+
+
+def fingerprint(df: pd.DataFrame, *extra) -> str:
+    """Short hash of the match data (and anything else) a result depends on."""
+    h = hashlib.sha256(repr(extra).encode() + CODE_VERSION.encode())
+    h.update(pd.util.hash_pandas_object(df.reindex(columns=_FP_COLS), index=False).values.tobytes())
+    return h.hexdigest()[:20]
 
 _lock = threading.Lock()
 _contexts: dict[tuple[str, str], "LeagueContext"] = {}
@@ -103,10 +120,14 @@ MODEL_ORDER = ["sheet", "form5", "dc", "ml", "gbm", "blend", "market"]
 
 
 def walk_forward(hist: pd.DataFrame, feats: pd.DataFrame, eval_seasons: list[str],
-                 xi: float = models.DC_XI) -> tuple[dict, dict]:
+                 xi: float = models.DC_XI, cache: dict | None = None) -> tuple[dict, dict]:
     """For each week of the evaluation seasons, refit every model on everything
     before that week and predict its matches. Nothing from the future leaks in:
     even the blend's weights only use matches that had already been played.
+
+    `cache` (week -> saved result) lets a weekly rebuild reuse every past week whose
+    inputs are unchanged, so normally only the newest week is computed. Once any week
+    has to be recomputed, every later week is too (the blend weights carry forward).
 
     Returns (predictions per model, final blend weights)."""
     ev = hist[hist.season.isin(eval_seasons)]
@@ -115,12 +136,27 @@ def walk_forward(hist: pd.DataFrame, feats: pd.DataFrame, eval_seasons: list[str
     ll_sum = {k: 0.0 for k in BLEND_MODELS}
     ll_n = {k: 0 for k in BLEND_MODELS}
 
+    reuse = cache is not None
     for wk in sorted(weeks.unique()):
         idx = ev.index[weeks == wk]
         start = ev.loc[idx, "date"].min()
         train = hist[hist.date < start]
         if len(train) < 200:
             continue
+        wkey, fp = str(wk), None
+        if cache is not None:
+            fp = fingerprint(pd.concat([train, hist.loc[idx]]), xi)
+            hit = cache.get(wkey)
+            if reuse and hit and hit["fp"] == fp:
+                for n, rows in hit["rows"].items():
+                    for p0, p1, p2, y, po, over in rows:
+                        preds[n].append((None, [p0, p1, p2], y, po, over))
+                for n, v in hit["ll"]:
+                    ll_sum[n] += v
+                    ll_n[n] += 1
+                continue
+            reuse = False           # recompute this week and everything after it
+        week_rows = {n: [] for n in MODEL_ORDER}
         season_train = train[train.season == ev.loc[idx[0], "season"]]
         long = analytics.team_matches(train)
         dc = models.DixonColes(xi=xi).fit(train, ref_date=start)
@@ -147,15 +183,21 @@ def walk_forward(hist: pd.DataFrame, feats: pd.DataFrame, eval_seasons: list[str
                     continue
                 mk = models.markets(*lam, rho=dc.rho if n in ("dc", "blend") else 0.0)
                 p = [mk["home"]["p"], mk["draw"]["p"], mk["away"]["p"]]
-                preds[n].append((i, p, y, mk["over"]["2.5"]["p"], over))
+                week_rows[n].append((i, p, y, mk["over"]["2.5"]["p"], bool(over)))
                 if n in ll_sum:
-                    week_ll.append((n, -np.log(max(p[y], 1e-9))))
+                    week_ll.append((n, float(-np.log(max(p[y], 1e-9)))))
             imp = models.implied_probs(r.odds_h, r.odds_d, r.odds_a)
             if imp:
-                preds["market"].append((i, imp, y, None, over))
+                week_rows["market"].append((i, imp, y, None, bool(over)))
+        for n, rows in week_rows.items():
+            preds[n].extend(rows)
         for n, v in week_ll:                           # only now may this week inform the weights
             ll_sum[n] += v
             ll_n[n] += 1
+        if cache is not None:
+            cache[wkey] = {"fp": fp, "ll": week_ll, "rows": {
+                n: [[*map(float, p), int(y), (None if po is None else float(po)), o] for _, p, y, po, o in rows]
+                for n, rows in week_rows.items() if rows}}
     return preds, accuracy_weights(ll_sum, ll_n)
 
 
@@ -196,7 +238,18 @@ def backtest(ctx: LeagueContext) -> dict:
         hist = ctx.history
         seasons = [s for s in (sources.previous_seasons(ctx.season, 1)[0], ctx.season)
                    if (hist.season == s).any()]
-        preds, weights = walk_forward(hist, ctx.feats, seasons)
+        cache_file = sources.CACHE_DIR / f"backtest_{ctx.div}_{ctx.season}.json"
+        try:
+            week_cache = json.loads(cache_file.read_text())
+        except Exception:
+            week_cache = {}
+        before = dict(week_cache)
+        t0 = time.time()
+        preds, weights = walk_forward(hist, ctx.feats, seasons, cache=week_cache)
+        new = sum(1 for k, v in week_cache.items() if before.get(k) is not v)
+        print(f"    backtest {ctx.div} {ctx.season}: {new} of {len(week_cache)} weeks computed, "
+              f"rest reused ({time.time() - t0:.1f}s)")
+        cache_file.write_text(json.dumps(week_cache, separators=(",", ":")))
 
         calib = {}
         bins = np.linspace(0, 1, 11)

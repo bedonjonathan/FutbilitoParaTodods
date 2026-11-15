@@ -27,22 +27,22 @@ def test_season_codes():
 
 def test_july_falls_back_to_last_season(cache, monkeypatch):
     # in July the new season's file does not exist yet
-    def fake_get(url):
+    def fake_get(url, headers=None):
         if "2728" in url:
             raise RuntimeError("404")
-        return CSV
+        return CSV, {}
     monkeypatch.setattr(sources, "_get", fake_get)
     assert sources.active_season("E0", dt.date(2027, 7, 10)) == "2627"
 
 
 def test_season_with_no_matches_yet_falls_back(cache, monkeypatch):
-    monkeypatch.setattr(sources, "_get", lambda url: CSV.split(b"\n")[0] + b"\n" if "2728" in url else CSV)
+    monkeypatch.setattr(sources, "_get", lambda url, headers=None: (CSV.split(b"\n")[0] + b"\n" if "2728" in url else CSV, {}))
     assert sources.active_season("E0", dt.date(2027, 8, 1)) == "2627"
 
 
 def test_finished_season_keeps_refreshing_until_downloaded_after_it_ended(cache, monkeypatch):
     calls = []
-    monkeypatch.setattr(sources, "_get", lambda url: calls.append(url) or CSV)
+    monkeypatch.setattr(sources, "_get", lambda url, headers=None: (calls.append(url) or CSV, {}))
     f = cache / "E0_2526.csv"
     f.write_bytes(CSV)
     before_end = dt.datetime(2026, 5, 14).timestamp()      # saved before the final matchday
@@ -58,7 +58,7 @@ def test_finished_season_keeps_refreshing_until_downloaded_after_it_ended(cache,
 def test_failed_download_serves_saved_copy_and_flags_it(cache, monkeypatch):
     (cache / "E0_2627.csv").write_bytes(CSV)
 
-    def boom(url):
+    def boom(url, headers=None):
         raise RuntimeError("site down")
     monkeypatch.setattr(sources, "_get", boom)
     df = sources.load_season("E0", "2627", force=True)
@@ -67,7 +67,7 @@ def test_failed_download_serves_saved_copy_and_flags_it(cache, monkeypatch):
 
 
 def test_error_page_is_not_saved_as_results(cache, monkeypatch):
-    monkeypatch.setattr(sources, "_get", lambda url: b"<html>Service unavailable</html>")
+    monkeypatch.setattr(sources, "_get", lambda url, headers=None: (b"<html>Service unavailable</html>", {}))
     with pytest.raises(ValueError):
         sources.load_season("E0", "2627")
     assert not (cache / "E0_2627.csv").exists()
@@ -91,6 +91,51 @@ def test_kickoff_times_are_converted_from_uk_time(cache, monkeypatch):
     fx = (b"Div,Date,Time,HomeTeam,AwayTeam,AvgH,AvgD,AvgA\n"
           b"SP1,21/11/2026,20:00,A,B,2.0,3.4,3.8\n"      # winter: UK time = UTC
           b"SP1,15/08/2026,20:00,C,D,2.0,3.4,3.8\n")     # summer: UK time = UTC+1
-    monkeypatch.setattr(sources, "_get", lambda url: fx)
+    monkeypatch.setattr(sources, "_get", lambda url, headers=None: (fx, {}))
     df = sources.load_fixtures_csv()
     assert list(df.kickoff) == ["2026-11-21T20:00:00Z", "2026-08-15T19:00:00Z"]
+
+
+def test_unchanged_file_is_not_downloaded_again(cache, monkeypatch):
+    """Second request sends the saved validators; a 304 reuses the saved copy."""
+    seen = []
+
+    def fake_get(url, headers=None):
+        seen.append(dict(headers or {}))
+        if headers and headers.get("If-None-Match") == '"v1"':
+            return None, {}                                   # 304 Not Modified
+        return CSV, {"etag": '"v1"', "last-modified": "Mon, 09 Nov 2026 10:03:06 GMT"}
+    monkeypatch.setattr(sources, "_get", fake_get)
+    first = sources.load_season("E0", "2627", force=True)
+    second = sources.load_season("E0", "2627", force=True)
+    assert seen[0] == {}
+    assert seen[1] == {"If-None-Match": '"v1"', "If-Modified-Since": "Mon, 09 Nov 2026 10:03:06 GMT"}
+    assert len(first) == len(second) == 1
+    assert "E0_2627.csv" not in sources.STALE_SERVED
+
+
+def test_player_history_needs_one_request_per_new_gameweek(cache, monkeypatch):
+    calls = []
+
+    def live(gw):
+        return {"elements": [{"id": 7, "stats": {"minutes": 90 - gw, "goals_scored": 1, "assists": 0,
+                                                 "expected_goals": "0.5", "expected_assists": "0.1",
+                                                 "total_points": 6},
+                              "explain": [{"fixture": 100 + gw}]}]}
+
+    def fake_get(url, headers=None):
+        calls.append(url)
+        gw = int(url.rstrip("/").split("/")[-2])
+        return __import__("json").dumps(live(gw)).encode(), {}
+    monkeypatch.setattr(sources, "_get", fake_get)
+    boot = {"events": [{"id": g, "finished": g <= 3, "data_checked": g <= 3} for g in range(1, 6)],
+            "elements": [{"id": 7, "team": 1}]}
+    fixtures = [{"id": 100 + g, "team_h": 1 if g % 2 else 2, "team_a": 2 if g % 2 else 1} for g in range(1, 6)]
+    h = sources.fpl_player_histories(boot, fixtures)
+    assert [g["round"] for g in h[7]] == [1, 2, 3]            # unfinished gameweeks are skipped
+    assert h[7][0]["opponents"] == [2] and h[7][0]["home"] is True
+    assert h[7][1]["home"] is False
+    assert len(calls) == 3
+    boot["events"][3].update(finished=True, data_checked=True)  # a week later: gameweek 4 done
+    sources.fpl_player_histories(boot, fixtures)
+    assert len(calls) == 4                                    # only the new gameweek was fetched

@@ -20,8 +20,29 @@ maths runs in the page.
 
 * **Refresh data** (in the app) loads the newest published data.
 * **Update now ↗** opens the workflow on GitHub; click **Run workflow** to rebuild any time
-  (about 20 minutes).
+  (a few minutes).
 * To change the schedule, edit the `cron:` line in `.github/workflows/pages.yml`.
+
+### Only new data is fetched and computed
+
+Results already in hand never change, so each Thursday's build only does what's new:
+
+* **Downloads:** each file is requested with "only if changed" headers, so an unchanged
+  file costs one tiny request and no download. Finished seasons are saved and never
+  requested again. Player stats are fetched once per completed gameweek (one request for
+  all players), instead of one request per player. A typical Thursday is about a dozen
+  requests in total.
+* **Computing:** the model test (Model Lab) saves each past week's results with a
+  fingerprint of the data and code it used. Next time, any week whose fingerprint matches
+  is reused, so only the newest week is computed. Finished seasons' pages are reused the
+  same way. If a source ever corrects an old result, or the model code changes, the
+  affected weeks are recomputed automatically.
+* **Where it's saved:** GitHub's build cache. A small Monday job (`keep-cache.yml`) touches
+  it so GitHub doesn't delete it after 7 days unused. If it is lost anyway, the next build
+  copies last week's pages from the live site and re-downloads what it needs once.
+
+The build log ends with a line such as
+`data sources: 12 requests, 3 answered 'not modified', 2.1 MB downloaded`.
 
 ### One-time setup (already done)
 **Settings → Pages → Build and deployment → Source: "GitHub Actions"**.
@@ -101,9 +122,9 @@ The build is designed so a bad Thursday never replaces a working site with a bro
 * The header shows the date of the latest result in the data ("results through …") and
   when the site was built, so stale data is visible.
 
-GitHub switches off scheduled workflows after 60 days without repository activity. The
-workflow re-enables itself on every run to prevent that; if updates ever stop anyway, open
-the Actions tab and click **Enable workflow**.
+GitHub switches off scheduled workflows after 60 days without repository activity. Both
+workflows re-enable themselves on every run to prevent that; if updates ever stop anyway,
+open the Actions tab and click **Enable workflow**.
 
 ## Security notes
 
@@ -127,7 +148,7 @@ backend/
   tune.py       optional: re-tune the Dixon-Coles time decay
 frontend/       index.html, styles.css, app.js, maths.js (odds maths), vendor/ (Chart.js, Inter)
 tests/          pytest suite, incl. a check that the Python and JavaScript maths agree
-.github/        weekly build + deploy workflow, Dependabot config
+.github/        weekly build + deploy workflow, Monday cache keep-warm, Dependabot config
 ```
 
 Run the tests with `pip install -r requirements-dev.txt && python -m pytest`.
