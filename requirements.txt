@@ -1,7 +1,7 @@
 # Exact versions, so every weekly build uses the same tested code.
 # Dependabot (.github/dependabot.yml) proposes updates; the tests run on each proposal.
 httpx==0.28.1
-numpy==2.5.3
-pandas==3.0.5
+numpy==2.5.4
+pandas==3.1.1
 scipy==1.18.1
 scikit-learn==1.9.1
