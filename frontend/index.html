@@ -4,10 +4,12 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Futbolito Analytics</title>
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+<!-- Everything is served from this site: no CDNs, no third-party requests. -->
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; font-src 'self'; img-src 'self' data:; connect-src 'self'; base-uri 'none'; form-action 'none'">
+<meta name="referrer" content="no-referrer">
 <link rel="stylesheet" href="styles.css">
-<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
+<script src="vendor/chart-4.4.1.umd.min.js"></script>
+<script src="maths.js"></script>
 </head>
 <body>
 <header class="topbar">
@@ -29,18 +31,19 @@
   </div>
 </header>
 
-<nav class="tabs" role="tablist">
-  <button class="tab active" data-tab="overview">Overview</button>
-  <button class="tab" data-tab="team">Teams</button>
-  <button class="tab" data-tab="predict">Match Predictor</button>
-  <button class="tab" data-tab="fixtures">Upcoming</button>
-  <button class="tab" data-tab="players">Players</button>
-  <button class="tab" data-tab="lab">Model Lab</button>
+<nav class="tabs" role="tablist" aria-label="Sections">
+  <button class="tab active" role="tab" id="tabbtn-overview" aria-controls="tab-overview" aria-selected="true" tabindex="0" data-tab="overview">Overview</button>
+  <button class="tab" role="tab" id="tabbtn-team" aria-controls="tab-team" aria-selected="false" tabindex="-1" data-tab="team">Teams</button>
+  <button class="tab" role="tab" id="tabbtn-predict" aria-controls="tab-predict" aria-selected="false" tabindex="-1" data-tab="predict">Match Predictor</button>
+  <button class="tab" role="tab" id="tabbtn-fixtures" aria-controls="tab-fixtures" aria-selected="false" tabindex="-1" data-tab="fixtures">Upcoming</button>
+  <button class="tab" role="tab" id="tabbtn-players" aria-controls="tab-players" aria-selected="false" tabindex="-1" data-tab="players">Players</button>
+  <button class="tab" role="tab" id="tabbtn-lab" aria-controls="tab-lab" aria-selected="false" tabindex="-1" data-tab="lab">Model Lab</button>
 </nav>
 
+<div id="banner" class="banner hidden" role="status"></div>
 <main>
   <!-- ============================== OVERVIEW -->
-  <section id="tab-overview" class="panel active">
+  <section id="tab-overview" class="panel active" role="tabpanel" aria-labelledby="tabbtn-overview" tabindex="0">
     <div class="kpis" id="kpis"></div>
     <div class="grid two">
       <div class="card span2">
@@ -71,7 +74,7 @@
   </section>
 
   <!-- ============================== TEAM -->
-  <section id="tab-team" class="panel">
+  <section id="tab-team" class="panel" role="tabpanel" aria-labelledby="tabbtn-team" tabindex="0">
     <div class="toolbar">
       <label>Team <select id="teamSelect"></select></label>
       <label>Rolling window
@@ -105,7 +108,7 @@
   </section>
 
   <!-- ============================== PREDICTOR -->
-  <section id="tab-predict" class="panel">
+  <section id="tab-predict" class="panel" role="tabpanel" aria-labelledby="tabbtn-predict" tabindex="0">
     <div class="toolbar">
       <label>Home <select id="homeSelect"></select></label>
       <button class="btn ghost" id="swap" title="Swap home and away">⇄</button>
@@ -116,16 +119,16 @@
   </section>
 
   <!-- ============================== FIXTURES -->
-  <section id="tab-fixtures" class="panel">
+  <section id="tab-fixtures" class="panel" role="tabpanel" aria-labelledby="tabbtn-fixtures" tabindex="0">
     <div class="card">
       <div class="card-head"><h2>Upcoming fixtures — blended model</h2></div>
-      <p class="hint">Probabilities from the blended model. When bookmaker odds are published, <b>Edge</b> = model probability − market probability (margin removed). Positive edge means the model rates that outcome higher than the market does.</p>
+      <p class="hint">Probabilities from the blended model. When bookmaker odds are published, <b>Gap vs market</b> = model probability − bookmaker probability (margin removed), in percentage points. Read it as a disagreement to look into, not a tip: over the tested matches the bookmakers have been more accurate than the model, so most gaps are the model's error. Only gaps of 5 points or more are highlighted.</p>
       <div id="fixturesOut"></div>
     </div>
   </section>
 
   <!-- ============================== PLAYERS -->
-  <section id="tab-players" class="panel">
+  <section id="tab-players" class="panel" role="tabpanel" aria-labelledby="tabbtn-players" tabindex="0">
     <div id="playersUnavailable" class="card hidden"><p>Player data comes from the official Fantasy Premier League API, so it's available for the <b>Premier League</b> only.</p></div>
     <div id="playersBody">
       <div class="toolbar">
@@ -153,7 +156,7 @@
   </section>
 
   <!-- ============================== LAB -->
-  <section id="tab-lab" class="panel">
+  <section id="tab-lab" class="panel" role="tabpanel" aria-labelledby="tabbtn-lab" tabindex="0">
     <div class="card">
       <h2>How good is each model? <span class="muted" id="btSeason"></span></h2>
       <p class="hint">Walk-forward backtest: before each week, every model is refitted using only matches played <i>before</i> that week, then it predicts that week's games. Bookmakers are the benchmark to beat. Lower log-loss / RPS / Brier is better.</p>
@@ -188,8 +191,10 @@
           <dd>Fits attack, defence and home advantage for every team at once by maximum likelihood over 3+ seasons, weighting recent games more (half-life ≈ 1 year). Adjusts schedule strength automatically and corrects 0-0 / 1-1 frequencies.</dd>
           <dt>ML Poisson (form + Elo)</dt>
           <dd>Machine learning: Poisson regressions trained on thousands of past matches. Inputs are each side's last-5 goals, shots on target, points and the Elo gap. The model learns how much each signal is really worth.</dd>
-          <dt>Blend</dt>
-          <dd>Geometric mean of the models' expected goals. Ensembles are usually more reliable than any single model.</dd>
+          <dt>Gradient boosting (form, xG, rest)</dt>
+          <dd>Boosted decision trees on the same last-5 signals plus last-5 xG and days of rest. Can pick up non-linear patterns, but needs more data than the simpler ML model to pay off.</dd>
+          <dt>Blend (accuracy-weighted)</dt>
+          <dd>Weighted average of the models' expected goals. Each model's weight comes from how well it predicted matches already played, so better models count for more. <span id="blendWeights"></span></dd>
         </dl>
         <h3>Fixes vs the spreadsheet</h3>
         <ul>
@@ -203,6 +208,11 @@
     </div>
   </section>
 </main>
+
+<footer class="foot">
+  <p><b>For information and entertainment only — not betting advice.</b> These are statistical estimates. In the Model Lab's own tests the bookmakers' odds are more accurate than every model here, so a model “edge” is usually the model being wrong, not the market. If you bet, only stake what you can afford to lose.</p>
+  <p>Match data: <a href="https://www.football-data.co.uk/" target="_blank" rel="noopener noreferrer">football-data.co.uk</a>. Player data: the Fantasy Premier League API. This site is unofficial and not affiliated with either, or with any league or club.</p>
+</footer>
 
 <div id="toast" class="toast hidden"></div>
 <script src="app.js"></script>

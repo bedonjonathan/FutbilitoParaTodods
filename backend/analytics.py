@@ -105,21 +105,32 @@ def elo_ratings(df: pd.DataFrame, k: float = 20.0, home_adv: float = 60.0,
 
 # --------------------------------------------------------------------------- ML features
 FORM_STATS = ("gf", "ga", "sotf", "sota", "pts")
+XG_STATS = ("xgf", "xga")          # only published for recent seasons -> may be NaN
+MAX_REST = 14.0                    # days; longer breaks are capped
+DEFAULT_REST = 7.0
+
+
+def _filled(t: pd.DataFrame, c: str) -> pd.Series:
+    """Shots on target, with a goals-based stand-in for the rare rows that lack them."""
+    if c in ("sotf", "sota"):
+        return t[c].fillna(t["gf" if c == "sotf" else "ga"] * 3)
+    return t[c]
 
 
 def prematch_features(df: pd.DataFrame, window: int = 5) -> pd.DataFrame:
     """For every match, each side's average over its previous `window` games
-    (any venue, across seasons) plus pre-match Elo. Only uses information
-    available before kick-off, so it is safe for training and backtesting."""
+    (any venue, across seasons), days of rest, and pre-match Elo. Only uses
+    information available before kick-off, so it is safe for training and backtesting."""
     long = team_matches(df)
     long = long.sort_values(["team", "date", "match_idx"])
-    g = long.groupby("team")
-    for c in FORM_STATS:
-        src = long[c] if c not in ("sotf", "sota") else long[c].fillna(long["gf" if c == "sotf" else "ga"] * 3)
+    for c in FORM_STATS + XG_STATS:
+        src = _filled(long, c)
         long[f"{c}_f"] = src.groupby(long.team).transform(
             lambda s: s.shift(1).rolling(window, min_periods=1).mean())
-    long["n_prev"] = g.cumcount()
-    feats = [f"{c}_f" for c in FORM_STATS] + ["n_prev"]
+    long["n_prev"] = long.groupby("team").cumcount()
+    rest = long.groupby("team").date.diff().dt.days
+    long["rest"] = rest.clip(upper=MAX_REST).fillna(DEFAULT_REST)
+    feats = [f"{c}_f" for c in FORM_STATS + XG_STATS] + ["n_prev", "rest"]
     h = long[long.venue == "H"].set_index("match_idx")[feats].add_prefix("h_")
     a = long[long.venue == "A"].set_index("match_idx")[feats].add_prefix("a_")
     elo, _ = elo_ratings(df)
@@ -128,19 +139,21 @@ def prematch_features(df: pd.DataFrame, window: int = 5) -> pd.DataFrame:
     return out
 
 
-def latest_form(df: pd.DataFrame, team: str, window: int = 5, long: pd.DataFrame | None = None) -> dict:
-    """Feature vector for a team's *next* match (average of its last `window` games)."""
+def latest_form(df: pd.DataFrame, team: str, window: int = 5, long: pd.DataFrame | None = None,
+                on_date=None) -> dict:
+    """Feature vector for a team's *next* match (average of its last `window` games).
+    `on_date` is the kick-off date if known, used for days of rest."""
     long = team_matches(df) if long is None else long
-    t = long[long.team == team].tail(window)
-    if t.empty:
-        return {f"{c}_f": np.nan for c in FORM_STATS} | {"n_prev": 0}
-    out = {}
-    for c in FORM_STATS:
-        col = t[c]
-        if c in ("sotf", "sota"):
-            col = col.fillna(t["gf" if c == "sotf" else "ga"] * 3)
-        out[f"{c}_f"] = float(col.mean())
-    out["n_prev"] = int((long.team == team).sum())
+    mine = long[long.team == team]
+    t = mine.tail(window)
+    out = {f"{c}_f": (float(_filled(t, c).mean()) if len(t) else np.nan) for c in FORM_STATS + XG_STATS}
+    out["n_prev"] = int(len(mine))
+    rest = DEFAULT_REST
+    if on_date is not None and len(mine):
+        days = (pd.Timestamp(on_date).tz_localize(None).normalize() - mine.date.iloc[-1]).days
+        if days > 0:
+            rest = min(MAX_REST, float(days))
+    out["rest"] = rest
     return out
 
 

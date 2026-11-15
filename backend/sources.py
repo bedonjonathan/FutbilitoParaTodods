@@ -13,8 +13,10 @@ from __future__ import annotations
 import datetime as dt
 import io
 import json
+import re
 import time
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import httpx
 import numpy as np
@@ -42,27 +44,53 @@ FPL = "https://fantasy.premierleague.com/api"
 
 HEADERS = {"User-Agent": "Mozilla/5.0 (football-analytics-app)"}
 
-# FPL short names -> football-data.co.uk names
+# FPL names -> football-data.co.uk names, where they differ by more than a suffix
 FPL_TO_FDUK = {
     "Man Utd": "Man United",
     "Spurs": "Tottenham",
-    "Nott'm Forest": "Nott'm Forest",
-    "Wolves": "Wolves",
-    "Coventry City": "Coventry",
-    "Hull City": "Hull",
-    "Ipswich Town": "Ipswich",
-    "Leicester City": "Leicester",
     "Sheffield Utd": "Sheffield United",
-    "Luton Town": "Luton",
+    "Sheffield Wed": "Sheffield Weds",
+    "Oxford Utd": "Oxford",
+    "West Bromwich Albion": "West Brom",
+    "Queens Park Rangers": "QPR",
+    "Wolverhampton Wanderers": "Wolves",
 }
+_SUFFIXES = re.compile(r"\s+(city|town|county|athletic|albion|fc|afc|utd|united|wanderers|rovers|north end)$", re.I)
+
+# downloads that failed this run and fell back to an older cached copy
+STALE_SERVED: set[str] = set()
 
 
 # --------------------------------------------------------------------------- seasons
 def current_season_code(today: dt.date | None = None) -> str:
-    """'2627' for the 2026/27 season (seasons roll over in July)."""
+    """'2627' for the 2026/27 season by the calendar (seasons roll over in July)."""
     today = today or dt.date.today()
     start = today.year if today.month >= 7 else today.year - 1
     return f"{start % 100:02d}{(start + 1) % 100:02d}"
+
+
+def season_end(season: str) -> dt.date:
+    """A date safely after the last match of a season (play-offs included)."""
+    return dt.date(2000 + int(season[2:]), 7, 15)
+
+
+_active: dict[str, str] = {}
+
+
+def active_season(div: str = "E0", today: dt.date | None = None) -> str:
+    """The newest season that actually has played matches for this league.
+
+    In July the calendar says the new season has started, but its data file does
+    not exist until the first matches in August - so fall back to the last one."""
+    key = f"{div}:{today or ''}"
+    if key not in _active:
+        cal = current_season_code(today)
+        try:
+            ok = len(load_season(div, cal)) > 0
+        except Exception:
+            ok = False
+        _active[key] = cal if ok else previous_seasons(cal, 1)[0]
+    return _active[key]
 
 
 def previous_seasons(season: str, n: int) -> list[str]:
@@ -86,7 +114,7 @@ def _get(url: str) -> bytes:
         return r.content
 
 
-def _cached(name: str, url: str, force: bool, max_age: float | None) -> bytes:
+def _cached(name: str, url: str, force: bool, max_age: float | None, validate=None) -> bytes:
     path = CACHE_DIR / name
     if path.exists() and not force:
         age = time.time() - path.stat().st_mtime
@@ -94,10 +122,14 @@ def _cached(name: str, url: str, force: bool, max_age: float | None) -> bytes:
             return path.read_bytes()
     try:
         data = _get(url)
+        if validate is not None:
+            validate(data)
     except Exception:
-        if path.exists():  # network down -> serve stale cache
+        if path.exists():  # download failed -> fall back to the older copy, and remember it
+            STALE_SERVED.add(name)
             return path.read_bytes()
         raise
+    STALE_SERVED.discard(name)
     path.write_bytes(data)
     return data
 
@@ -144,13 +176,28 @@ def _parse_matches(raw: bytes, div: str, season: str) -> pd.DataFrame:
     return out.sort_values("date").reset_index(drop=True)
 
 
+def _looks_like_results(raw: bytes) -> None:
+    head = raw[:300].decode("utf-8", "ignore")
+    if "HomeTeam" not in head or "FTHG" not in head:
+        raise ValueError("download is not a results CSV")
+
+
+def season_is_final(div: str, season: str) -> bool:
+    """True once our cached copy was downloaded after the season ended, so it holds
+    every match and never needs fetching again. Until then it keeps refreshing -
+    otherwise the final rounds could be missed when the season rolls over."""
+    ts = cache_timestamp(f"{div}_{season}.csv")
+    return ts is not None and dt.date.fromtimestamp(ts) > season_end(season)
+
+
 def load_season(div: str, season: str, force: bool = False) -> pd.DataFrame:
-    is_current = season == current_season_code()
+    final = season_is_final(div, season)
     raw = _cached(
         f"{div}_{season}.csv",
         FDUK.format(season=season, div=div),
-        force=force and is_current,
-        max_age=STALE_AFTER if is_current else None,
+        force=force and not final,
+        max_age=None if final else STALE_AFTER,
+        validate=_looks_like_results,
     )
     return _parse_matches(raw, div, season)
 
@@ -171,10 +218,15 @@ def load_fixtures_csv(force: bool = False) -> pd.DataFrame:
     df = pd.read_csv(io.BytesIO(raw), encoding="utf-8-sig", on_bad_lines="skip")
     if df.empty:
         return df
+    times = df["Time"].astype(str) if "Time" in df.columns else pd.Series(["12:00"] * len(df))
+    # the feed gives UK kick-off times; publish them as UTC so browsers localise correctly
+    local = pd.to_datetime(df["Date"].astype(str) + " " + times, dayfirst=True, errors="coerce")
+    kickoff = local.dt.tz_localize(ZoneInfo("Europe/London"), ambiguous="NaT", nonexistent="NaT") \
+                   .dt.tz_convert("UTC").dt.strftime("%Y-%m-%dT%H:%M:%SZ")
     out = pd.DataFrame({
         "div": df["Div"], "home": df["HomeTeam"], "away": df["AwayTeam"],
         "date": pd.to_datetime(df["Date"], dayfirst=True, errors="coerce"),
-        "time": df.get("Time", pd.Series([""] * len(df))).astype(str),
+        "time": times, "kickoff": kickoff,
         "odds_h": df.get("AvgH"), "odds_d": df.get("AvgD"), "odds_a": df.get("AvgA"),
         "odds_o25": df.get("Avg>2.5"), "odds_u25": df.get("Avg<2.5"),
     })
@@ -196,15 +248,25 @@ def fpl_player_history(player_id: int, force: bool = False) -> dict:
     ))
 
 
-def fpl_team_names(bootstrap: dict, known: set[str] | None = None) -> dict[int, str]:
-    """FPL team id -> football-data.co.uk team name."""
-    out = {}
+def match_team(name: str, known: set[str]) -> str | None:
+    """Map an FPL team name onto a football-data.co.uk name. Exact and alias matches
+    first, then the name with its suffix removed ("Hull City" -> "Hull"). Never guesses:
+    returns None when there is no unambiguous match."""
+    for cand in (name, FPL_TO_FDUK.get(name)):
+        if cand and cand in known:
+            return cand
+    base = _SUFFIXES.sub("", name).strip().lower()
+    hits = [k for k in known if k.lower() == base or _SUFFIXES.sub("", k).strip().lower() == base]
+    return hits[0] if len(hits) == 1 else None
+
+
+def fpl_team_names(bootstrap: dict, known: set[str]) -> tuple[dict[int, str], list[str]]:
+    """FPL team id -> football-data.co.uk name, plus the FPL names we could not match."""
+    out, unmatched = {}, []
     for t in bootstrap["teams"]:
-        name = FPL_TO_FDUK.get(t["name"], t["name"])
-        if known and name not in known:
-            # fuzzy fallback: first known team sharing the first word
-            first = name.split()[0].lower()
-            match = next((k for k in known if k.lower().startswith(first)), None)
-            name = match or name
-        out[t["id"]] = name
-    return out
+        m = match_team(t["name"], known)
+        if m is None:
+            unmatched.append(t["name"])
+        else:
+            out[t["id"]] = m
+    return out, unmatched

@@ -23,55 +23,6 @@ async function getJSON(path, fresh = false) {
 }
 const L = () => state.league;
 
-// ---- Poisson / Dixon-Coles maths (same as backend/models.py)
-const MAXG = 10;
-function poissonPmf(lam) {
-  const out = [Math.exp(-lam)];
-  for (let k = 1; k <= MAXG; k++) out.push(out[k - 1] * lam / k);
-  return out;
-}
-function americanOdds(p) {
-  if (!(p > 0 && p < 1)) return null;
-  return p >= 0.5 ? Math.round(-100 * p / (1 - p)) : Math.round(100 * (1 - p) / p);
-}
-const price = (p) => ({ p, decimal: p > 0 ? 1 / p : null, american: americanOdds(p) });
-function markets(lh, la, rho = 0) {
-  const ph = poissonPmf(lh), pa = poissonPmf(la);
-  const m = ph.map((x) => pa.map((y) => x * y));
-  if (rho) {
-    m[0][0] *= 1 - lh * la * rho; m[0][1] *= 1 + lh * rho; m[1][0] *= 1 + la * rho; m[1][1] *= 1 - rho;
-  }
-  let tot = 0; m.forEach((r) => r.forEach((v, j) => { r[j] = Math.max(0, v); tot += r[j]; }));
-  m.forEach((r) => r.forEach((v, j) => (r[j] = v / tot)));
-  const sum = (f) => { let t = 0; m.forEach((r, h) => r.forEach((v, a) => { if (f(h, a)) t += v; })); return t; };
-  const lines = ["0.5", "1.5", "2.5", "3.5", "4.5"];
-  const flat = [];
-  for (let h = 0; h < 7; h++) for (let a = 0; a < 7; a++) flat.push([m[h][a], `${h}-${a}`]);
-  flat.sort((x, y) => y[0] - x[0]);
-  return {
-    lambda_home: lh, lambda_away: la, rho,
-    home: price(sum((h, a) => h > a)), draw: price(sum((h, a) => h === a)), away: price(sum((h, a) => h < a)),
-    btts_yes: price(sum((h, a) => h > 0 && a > 0)),
-    home_cs: price(sum((h, a) => a === 0)), away_cs: price(sum((h, a) => h === 0)),
-    over: Object.fromEntries(lines.map((t) => [t, price(sum((h, a) => h + a > +t))])),
-    under: Object.fromEntries(lines.map((t) => [t, price(sum((h, a) => h + a < +t))])),
-    home_goals_dist: m.slice(0, 7).map((r) => r.reduce((x, y) => x + y, 0)),
-    away_goals_dist: [0, 1, 2, 3, 4, 5, 6].map((a) => m.reduce((x, r) => x + r[a], 0)),
-    matrix: m.slice(0, 7).map((r) => r.slice(0, 7)),
-    top_scores: flat.slice(0, 8).map(([p, score]) => ({ score, ...price(p) })),
-  };
-}
-function implied(o) {
-  if (!o || o.some((x) => !(x > 0))) return null;
-  const inv = o.map((x) => 1 / x), t = inv.reduce((a, b) => a + b, 0);
-  return inv.map((x) => x / t);
-}
-function rolling(arr, w) {
-  return arr.map((_, i) => {
-    const sl = arr.slice(Math.max(0, i - w + 1), i + 1).filter((x) => x != null);
-    return sl.length ? sl.reduce((a, b) => a + b, 0) / sl.length : null;
-  });
-}
 function workflowUrl() {
   const m = location.hostname.match(/^([^.]+)\.github\.io$/);
   const repo = location.pathname.split("/").filter(Boolean)[0];
@@ -89,7 +40,7 @@ function stamp(ts) {
 
 // ------------------------------------------------------------------ chart base
 function chartDefaults() {
-  Chart.defaults.font.family = "Inter, system-ui, sans-serif";
+  Chart.defaults.font.family = '"Inter Variable", Inter, system-ui, sans-serif';
   Chart.defaults.font.size = 12;
   Chart.defaults.color = css("--text-secondary");
   Chart.defaults.borderColor = css("--grid");
@@ -135,7 +86,16 @@ async function boot() {
   $("#season").onchange = (e) => { state.season = e.target.value; loadLeague(); };
   $("#refresh").onclick = refresh;
   $("#themeToggle").onclick = toggleTheme;
-  $$(".tab").forEach((b) => (b.onclick = () => showTab(b.dataset.tab)));
+  const tabs = $$(".tab");
+  tabs.forEach((b, i) => {
+    b.onclick = () => showTab(b.dataset.tab);
+    b.onkeydown = (e) => {   // arrow keys move between tabs, as screen-reader users expect
+      const step = e.key === "ArrowRight" ? 1 : e.key === "ArrowLeft" ? -1 : 0;
+      const to = e.key === "Home" ? 0 : e.key === "End" ? tabs.length - 1 : step ? (i + step + tabs.length) % tabs.length : null;
+      if (to === null) return;
+      e.preventDefault(); tabs[to].focus(); showTab(tabs[to].dataset.tab);
+    };
+  });
   $$("#tableVenue button").forEach((b) => (b.onclick = () => {
     $$("#tableVenue button").forEach((x) => x.classList.toggle("on", x === b));
     state.tableVenue = b.dataset.v; renderTable();
@@ -174,7 +134,12 @@ function rerenderAll() {
 
 function showTab(tab) {
   state.tab = tab;
-  $$(".tab").forEach((b) => b.classList.toggle("active", b.dataset.tab === tab));
+  $$(".tab").forEach((b) => {
+    const on = b.dataset.tab === tab;
+    b.classList.toggle("active", on);
+    b.setAttribute("aria-selected", on ? "true" : "false");
+    b.tabIndex = on ? 0 : -1;
+  });
   $$(".panel").forEach((p) => p.classList.toggle("active", p.id === "tab-" + tab));
   if (tab === "team" && !state.team) loadTeam();
   if (tab === "predict" && !state.prediction) loadPrediction();
@@ -205,18 +170,30 @@ async function loadLeague() {
   $("#dataStamp").textContent = "Loading…";
   Object.assign(state, { team: null, prediction: null, fixtures: null, backtest: null });
   try {
-    const key = `${state.div}_${state.season}`;
-    if (!state.meta.available.includes(key)) throw new Error("This league/season isn't published yet.");
+    let key = `${state.div}_${state.season}`;
+    if (!state.meta.available.includes(key)) {
+      // e.g. a league whose new season hasn't kicked off yet: show its latest published season
+      const fallback = state.meta.default_season?.[state.div];
+      if (!fallback) throw new Error("No data is published for this league yet.");
+      state.season = fallback; $("#season").value = fallback; key = `${state.div}_${fallback}`;
+    }
     const o = await getJSON(`${key}.json`);
     state.league = o; state.overview = o;
-    $("#dataStamp").textContent = `${o.league.name} ${o.season_label} · ${o.stats.matches || 0} matches · ${stamp(state.meta.generated)}`;
+    const through = o.data_through ? new Date(o.data_through + "T12:00:00").toLocaleDateString([], { day: "numeric", month: "short", year: "numeric" }) : "–";
+    $("#dataStamp").textContent = `${o.league.name} ${o.season_label} · ${o.stats.matches || 0} matches · results through ${through} · ${stamp(state.meta.generated).replace("Updated", "built")}`;
+    const kept = (state.meta.kept_from_previous_build || []).includes(key);
+    const problems = [];
+    if (o.stale || kept) problems.push("The last update couldn't download fresh results for this league, so this page shows data saved from an earlier update.");
+    if (o.league.players && (state.meta.warnings || []).some((w) => w.includes("FPL"))) problems.push("Player data could not be fully refreshed in the last update.");
+    $("#banner").classList.toggle("hidden", !problems.length);
+    $("#banner").innerHTML = problems.length ? `<b>Heads up:</b> ${problems.map(esc).join(" ")}` : "";
     const opts = o.teams.map((t) => `<option>${esc(t)}</option>`).join("");
     const keepTeam = $("#teamSelect").value;
     $("#teamSelect").innerHTML = opts;
     if (o.teams.includes(keepTeam)) $("#teamSelect").value = keepTeam; else $("#teamSelect").value = o.table[0]?.team;
     $("#homeSelect").innerHTML = opts; $("#awaySelect").innerHTML = opts;
     $("#homeSelect").value = o.table[0]?.team; $("#awaySelect").value = o.table[1]?.team;
-    const playersOk = o.league.players && state.season === state.meta.current_season && state.meta.players;
+    const playersOk = o.league.players && state.season === state.meta.default_season?.[state.div] && state.meta.players;
     $("#playersUnavailable").classList.toggle("hidden", playersOk);
     $("#playersBody").classList.toggle("hidden", !playersOk);
     renderOverview(o);
@@ -299,7 +276,7 @@ function labelPlugin(fn) {
     afterDatasetsDraw(chart) {
       const { ctx } = chart;
       ctx.save();
-      ctx.font = "500 11px Inter, system-ui";
+      ctx.font = '500 11px "Inter Variable", Inter, system-ui';
       ctx.fillStyle = css("--text-secondary");
       chart.data.datasets.forEach((ds, i) => {
         chart.getDatasetMeta(i).data.forEach((el, j) => {
@@ -435,7 +412,7 @@ function renderPrediction(P) {
 
   const ou = ["0.5", "1.5", "2.5", "3.5", "4.5"].map((t) => `<tr><td class="l">${t}</td><td>${pct(m.over[t].p, 1)}</td><td>${f2(m.over[t].decimal)}</td><td>${amer(m.over[t].american)}</td><td>${pct(m.under[t].p, 1)}</td><td>${f2(m.under[t].decimal)}</td><td>${amer(m.under[t].american)}</td></tr>`).join("");
 
-  const order = ["sheet", "form5", "dc", "ml", "blend"];
+  const order = ["sheet", "form5", "dc", "ml", "gbm", "blend"];
   const cmp = order.filter((k) => P.models[k]).map((k) => {
     const x = P.models[k];
     return `<tr class="${k === key ? "best" : ""}"><td class="l">${esc(P.model_names[k])}</td><td>${f2(x.lambda_home)}</td><td>${f2(x.lambda_away)}</td><td>${pct(x.home.p, 1)}</td><td>${pct(x.draw.p, 1)}</td><td>${pct(x.away.p, 1)}</td><td>${pct(x.over["2.5"].p, 0)}</td><td>${pct(x.btts_yes.p, 0)}</td><td class="l">${x.top_scores[0].score}</td></tr>`;
@@ -449,7 +426,7 @@ function renderPrediction(P) {
   const formList = (rows) => rows.slice().reverse().map((r) => `<div class="row"><span>${r.date.slice(5)} ${r.venue === "H" ? "vs" : "@"} ${esc(r.opp)}</span><span>${r.gf}-${r.ga} ${formChips(r.res)}</span></div>`).join("") || "<span class='muted'>No matches yet</span>";
   const h2h = P.h2h.map((g) => `<tr><td class="l">${g.date}</td><td class="l">${esc(g.home)}</td><td>${g.hg}-${g.ag}</td><td class="l">${esc(g.away)}</td></tr>`).join("") || `<tr><td class="l muted">No meetings in the data window</td></tr>`;
 
-  const scorerBlock = (rows, color) => rows.map((r) => `<div class="scorer" title="${esc(r.news || "")}"><span>${esc(r.name)}${r.availability < 1 ? ` <span class="muted">(${Math.round(r.availability * 100)}% fit)</span>` : ""}</span><span class="bar"><i style="width:${Math.min(100, r.p_score * 200)}%;background:${color}"></i></span><span class="num">${pct(r.p_score)}</span></div>`).join("");
+  const scorerBlock = (rows, color) => rows.map((r) => `<div class="scorer" title="${esc(r.news || "")}"><span>${esc(r.name)}${r.pens ? ` <span class="tag" title="First-choice penalty taker">pens</span>` : ""}${r.availability < 1 ? ` <span class="muted">(${Math.round(r.availability * 100)}% fit)</span>` : ""}</span><span class="bar"><i style="width:${Math.min(100, r.p_score * 200)}%;background:${color}"></i></span><span class="num">${pct(r.p_score)}</span></div>`).join("");
 
   $("#predictOut").innerHTML = `
   <div class="card">
@@ -502,7 +479,7 @@ function renderPrediction(P) {
       <div class="table-wrap"><table class="data"><thead><tr><th class="l">Model</th><th>xG home</th><th>xG away</th><th>Home</th><th>Draw</th><th>Away</th><th>O2.5</th><th>BTTS</th><th class="l">Top score</th></tr></thead><tbody>${cmp.join("")}${marketRow}</tbody></table></div>
       <p class="note">Check the Model Lab tab to see which model has actually been most accurate this season.</p>
     </div>
-    ${P.scorers ? `<div class="card span2"><h2>Anytime goalscorer chances <span class="muted">(blend xG × player's share of team xG × fitness)</span></h2>
+    ${P.scorers ? `<div class="card span2"><h2>Anytime goalscorer chances <span class="muted">(team expected goals × player's xG rate × recent minutes × fitness)</span></h2>
       <div class="grid two inner"><div><h3>${esc(P.home)}</h3>${scorerBlock(P.scorers.home, H)}</div><div><h3>${esc(P.away)}</h3>${scorerBlock(P.scorers.away, A)}</div></div></div>` : ""}
     <div class="card span2">
       <h2>Head to head <span class="muted">(last 3 seasons)</span></h2>
@@ -527,13 +504,13 @@ function renderFixtures(F) {
   const rows = F.fixtures.map((f) => {
     const dt = f.kickoff ? new Date(f.kickoff) : null;
     const when = dt ? dt.toLocaleDateString([], { weekday: "short", day: "numeric", month: "short" }) + " " + dt.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }) : "";
-    const edge = f.edge ? f.edge.map((e) => `<span class="${e > 0.03 ? "edge-pos" : "edge-neg"}">${sign(e * 100, 1)}</span>`).join(" / ") : "–";
+    const edge = f.edge ? f.edge.map((e) => `<span class="${Math.abs(e) >= 0.05 ? "best" : "edge-neg"}">${sign(e * 100, 1)}</span>`).join(" / ") : "–";
     return `<tr class="clickable" data-h="${esc(f.home)}" data-a="${esc(f.away)}"><td class="l">${f.round ? "GW" + f.round + " · " : ""}${when}</td><td class="l team-cell">${esc(f.home)}</td><td class="l team-cell">${esc(f.away)}</td>
       <td>${f2(f.lambda_home)} – ${f2(f.lambda_away)}</td>
       <td class="l"><div class="small-bar" title="Home ${pct(f.p[0])} · Draw ${pct(f.p[1])} · Away ${pct(f.p[2])}"><div style="flex:${f.p[0]};background:${H}"></div><div style="flex:${f.p[1]};background:${D}"></div><div style="flex:${f.p[2]};background:${A}"></div></div></td>
       <td>${pct(f.p[0])}</td><td>${pct(f.p[1])}</td><td>${pct(f.p[2])}</td><td>${pct(f.over25)}</td><td>${pct(f.btts)}</td><td>${f.top_score}</td>${anyOdds ? `<td>${edge}</td>` : ""}</tr>`;
   }).join("");
-  $("#fixturesOut").innerHTML = `<div class="table-wrap"><table class="data"><thead><tr><th class="l">Kick-off</th><th class="l">Home</th><th class="l">Away</th><th>Exp. goals</th><th class="l"><span class="swatch" style="background:${H}"></span>H <span class="swatch" style="background:${D}"></span>D <span class="swatch" style="background:${A}"></span>A</th><th>Home</th><th>Draw</th><th>Away</th><th>O2.5</th><th>BTTS</th><th>Top score</th>${anyOdds ? "<th>Edge H/D/A (pts)</th>" : ""}</tr></thead><tbody>${rows}</tbody></table></div>
+  $("#fixturesOut").innerHTML = `<div class="table-wrap"><table class="data"><thead><tr><th class="l">Kick-off</th><th class="l">Home</th><th class="l">Away</th><th>Exp. goals</th><th class="l"><span class="swatch" style="background:${H}"></span>H <span class="swatch" style="background:${D}"></span>D <span class="swatch" style="background:${A}"></span>A</th><th>Home</th><th>Draw</th><th>Away</th><th>O2.5</th><th>BTTS</th><th>Top score</th>${anyOdds ? '<th title="Model probability minus bookmaker probability, in percentage points. Bookmakers have been more accurate than the model, so treat gaps as questions, not tips.">Gap vs market H/D/A</th>' : ""}</tr></thead><tbody>${rows}</tbody></table></div>
   <p class="note">Click a fixture to open it in the Match Predictor.</p>`;
   $$("#fixturesOut tr.clickable").forEach((tr) => (tr.onclick = () => { $("#homeSelect").value = tr.dataset.h; $("#awaySelect").value = tr.dataset.a; showTab("predict"); loadPrediction(); }));
 }
@@ -621,6 +598,9 @@ async function loadBacktest() {
   else $("#btOut").textContent = "Backtest not available for this league/season yet.";
 }
 function renderBacktest(B) {
+  const w = B.blend_weights;
+  $("#blendWeights").textContent = w ? "Current weights: " + Object.entries(w).sort((a, b) => b[1] - a[1])
+    .map(([k, v]) => `${(state.meta.models[k] || k).split(" (")[0]} ${Math.round(v * 100)}%`).join(", ") + "." : "";
   $("#btSeason").textContent = `(${B.season_label})`;
   const best = (k) => Math.min(...B.summary.map((s) => s[k]));
   const bestAcc = Math.max(...B.summary.map((s) => s.accuracy));

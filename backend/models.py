@@ -13,7 +13,10 @@ dc      Dixon-Coles: maximum-likelihood attack/defence/home-advantage ratings ov
 ml      Machine learning: two Poisson GLMs (home goals, away goals) trained on
         every past match using last-5-game form (goals, shots on target, points)
         and Elo ratings as features.
-blend   Average of the models' expected goals (an ensemble).
+gbm     Gradient-boosted trees on the same form features plus last-5 xG and days
+        of rest. Can pick up non-linear effects the GLM cannot.
+blend   Weighted average of the models' expected goals; the weights come from how
+        well each model has predicted past matches (see engine.walk_forward).
 """
 from __future__ import annotations
 
@@ -23,6 +26,7 @@ import numpy as np
 import pandas as pd
 from scipy.optimize import minimize, minimize_scalar
 from scipy.stats import poisson
+from sklearn.ensemble import HistGradientBoostingRegressor
 from sklearn.linear_model import PoissonRegressor
 from sklearn.pipeline import make_pipeline
 from sklearn.preprocessing import StandardScaler
@@ -35,7 +39,8 @@ MODEL_NAMES = {
     "form5": "Last-5 form (+xG)",
     "dc": "Dixon-Coles (time-weighted)",
     "ml": "ML Poisson (form + Elo)",
-    "blend": "Blend (ensemble)",
+    "gbm": "Gradient boosting (form, xG, rest)",
+    "blend": "Blend (accuracy-weighted)",
 }
 
 
@@ -86,7 +91,7 @@ def markets(lh: float, la: float, rho: float = 0.0) -> dict:
         "matrix": m[:7, :7].tolist(),
     }
     flat = [(m[h, a], f"{h}-{a}") for h in range(7) for a in range(7)]
-    out["top_scores"] = [{"score": s, **_price(p)} for p, s in sorted(flat, reverse=True)[:8]]
+    out["top_scores"] = [{"score": s, **_price(p)} for p, s in sorted(flat, key=lambda t: (-round(t[0] * 1e12), t[1]))[:8]]
     return out
 
 
@@ -143,8 +148,11 @@ def form_lambdas(history: pd.DataFrame, season_df: pd.DataFrame, home: str, away
 
 
 # --------------------------------------------------------------------------- Dixon-Coles
+DC_XI = 0.0019   # time decay per day; chosen with backend/tune.py
+
+
 class DixonColes:
-    def __init__(self, xi: float = 0.0019, ridge: float = 0.05):
+    def __init__(self, xi: float = DC_XI, ridge: float = 0.05):
         self.xi = xi            # time decay per day (half-life ~ 1 year)
         self.ridge = ridge      # L2 penalty: keeps teams with few games near average
 
@@ -222,32 +230,56 @@ class DixonColes:
 
 # --------------------------------------------------------------------------- ML
 ML_FEATURES = ["elo_diff"] + [f"{s}_{c}_f" for s in ("h", "a") for c in analytics.FORM_STATS]
+GBM_FEATURES = ML_FEATURES + [f"{s}_{c}" for s in ("h", "a") for c in ("xgf_f", "xga_f", "rest")]
 
 
 class FormML:
-    """Poisson GLMs on last-5 form + Elo. Learns how much each recent-form signal
-    actually matters, instead of hand-picking weights."""
+    """Goal models on last-5 form + Elo. They learn how much each recent-form signal
+    actually matters, instead of hand-picking weights.
+
+    kind="glm"  two Poisson regressions (linear, very stable on small data)
+    kind="gbm"  two gradient-boosted tree models with a Poisson loss; also see last-5
+                xG and days of rest, and cope with seasons where xG is missing."""
+
+    def __init__(self, kind: str = "glm"):
+        self.kind = kind
+        self.features = ML_FEATURES if kind == "glm" else GBM_FEATURES
+
+    def _new(self):
+        if self.kind == "glm":
+            return make_pipeline(StandardScaler(), PoissonRegressor(alpha=1e-3, max_iter=500))
+        return HistGradientBoostingRegressor(
+            loss="poisson", max_depth=2, learning_rate=0.04, max_iter=120,
+            min_samples_leaf=40, l2_regularization=2.0, random_state=0)
+
+    def _X(self, feats: pd.DataFrame) -> pd.DataFrame:
+        X = feats.reindex(columns=self.features)
+        return X.fillna(self.fill) if self.kind == "glm" else X   # trees handle NaN themselves
 
     def fit(self, df: pd.DataFrame, feats: pd.DataFrame) -> "FormML":
         mask = (feats.h_n_prev >= 3) & (feats.a_n_prev >= 3)
-        X = feats.loc[mask, ML_FEATURES].fillna(feats[ML_FEATURES].mean())
-        self.fill = X.mean()
-        self.home_model = make_pipeline(StandardScaler(), PoissonRegressor(alpha=1e-3, max_iter=500))
-        self.away_model = make_pipeline(StandardScaler(), PoissonRegressor(alpha=1e-3, max_iter=500))
+        avail = feats.loc[mask].reindex(columns=self.features)
+        # a feature with no data at all in training (xG before it was published) is left out
+        self.features = [f for f in self.features if avail[f].notna().any()]
+        self.fill = avail[self.features].mean()
+        X = self._X(feats.loc[mask])
+        self.home_model, self.away_model = self._new(), self._new()
         self.home_model.fit(X, df.loc[X.index, "hg"])
         self.away_model.fit(X, df.loc[X.index, "ag"])
         self.n_train = int(len(X))
         return self
 
-    def predict(self, X: pd.DataFrame) -> np.ndarray:
-        X = X[ML_FEATURES].fillna(self.fill)
+    def predict(self, feats: pd.DataFrame) -> np.ndarray:
+        X = self._X(feats)
         return np.column_stack([self.home_model.predict(X), self.away_model.predict(X)])
 
-    def lambdas_for(self, history: pd.DataFrame, home: str, away: str, elo: dict, long=None):
+    def lambdas_for(self, history: pd.DataFrame, home: str, away: str, elo: dict, long=None, on_date=None):
         if home not in elo or away not in elo:
             return None
-        fh = analytics.latest_form(history, home, long=long)
-        fa = analytics.latest_form(history, away, long=long)
+        fh = analytics.latest_form(history, home, long=long, on_date=on_date)
+        fa = analytics.latest_form(history, away, long=long, on_date=on_date)
+        if fh["n_prev"] < 3 or fa["n_prev"] < 3:
+            return None
         row = {"elo_diff": (elo[home] - elo[away]) / 100.0}
         row |= {f"h_{k}": v for k, v in fh.items()}
         row |= {f"a_{k}": v for k, v in fa.items()}
@@ -255,10 +287,10 @@ class FormML:
         return float(lh), float(la)
 
     def importance(self) -> list[dict]:
+        """Standardised GLM coefficients (only meaningful for kind='glm')."""
         out = []
         for side, mdl in (("home goals", self.home_model), ("away goals", self.away_model)):
-            coefs = mdl[-1].coef_
-            for f, c in zip(ML_FEATURES, coefs):
+            for f, c in zip(self.features, mdl[-1].coef_):
                 out.append({"target": side, "feature": f, "coef": float(c)})
         return out
 
